@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
-"""Sonoff POWR3 -> MQTT bridge over eWeLink LAN (offline; no cloud, no eWeLink token).
+"""Sonoff POWR3 <-> MQTT bridge — HYBRID (LAN for switch+control, cloud for power).
 
-The POWR3 advertises its state over mDNS (_ewelink._tcp) with the params AES-encrypted
-using the device key (fetched once from the cloud). We listen, decrypt, and publish the
-shore-power readings to MQTT, where signalk-mqtt-sensors maps them into SignalK
-(electrical.ac.shore.*). Same read-only, offline-first model as the other bridges.
+The POWR3 advertises over mDNS (_ewelink._tcp) with params AES-encrypted using the
+device key. Two paths, because the POWR3 does NOT reliably report live power/V/A over
+eWeLink LAN (firmware only pushes on large threshold changes):
+  • LAN  — switch STATE + relay CONTROL, fully OFFLINE. We decrypt the mDNS state and
+           publish it; a cmd topic drives control by POSTing to the device's
+           /zeroconf/switch (encrypted) at the IP+port discovered via mDNS.
+  • CLOUD— power / voltage / current, polled ~30s from the eWeLink cloud (needs a
+           CoolKit v2 access token in EWELINK_TOKEN). Skipped if no token.
+signalk-mqtt-sensors maps the published topics into SignalK (electrical.ac.shore.*).
 
 Env:
   DEVICE_ID       eWeLink deviceid (e.g. 10013c5fde)
   DEVICE_KEY      eWeLink devicekey (SECRET) — from the cloud API once
+  EWELINK_TOKEN   CoolKit v2 access token (SECRET) — enables cloud power poll
+  EWELINK_REGION  cloud region, default eu
   MQTT_HOST       default 127.0.0.1
   MQTT_PORT       default 1883
   TOPIC_PREFIX    default maracaibo/sonoff/powr3
