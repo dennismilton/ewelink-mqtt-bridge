@@ -38,35 +38,50 @@ def decrypt(props):
     pt = pt[: -pt[-1]]                                        # strip PKCS7 padding
     return json.loads(pt)
 
-class Listener:
-    def __init__(self, client):
-        self.client = client
-        self.last_seq = None
-
-    def _handle(self, zc, type_, name):
-        info = zc.get_service_info(type_, name, timeout=2000)
-        if not info:
-            return
-        props = {}
-        for k, v in (info.properties or {}).items():
-            try:
-                props[k.decode()] = v.decode() if isinstance(v, bytes) else v
-            except Exception:
-                pass
-        if props.get("id") != DEVICE_ID:
-            return
-        seq = props.get("seq")
-        if seq and seq == self.last_seq:
-            return
-        self.last_seq = seq
+def _props(info):
+    out = {}
+    for k, v in (info.properties or {}).items():
         try:
-            params = decrypt(props) if props.get("encrypt") in ("true", True) else {}
-        except Exception as e:
-            log("decrypt failed:", e)
-            return
-        self.publish(params)
+            out[k.decode()] = v.decode() if isinstance(v, bytes) else v
+        except Exception:
+            pass
+    return out
 
-    def publish(self, p):
+class Listener:
+    def __init__(self, client, zc):
+        self.client = client
+        self.zc = zc
+        self.name = None          # our device's mDNS instance name, once discovered
+
+    def _is_ours(self, info):
+        return bool(info) and _props(info).get("id") == DEVICE_ID
+
+    # eWeLink pushes are unreliable; we poll (re-query) instead. But still grab the
+    # instance name from discovery so poll() knows what to re-query.
+    def add_service(self, zc, type_, name):    self._maybe(zc, type_, name)
+    def update_service(self, zc, type_, name): self._maybe(zc, type_, name)
+    def remove_service(self, zc, type_, name): pass
+    def _maybe(self, zc, type_, name):
+        info = zc.get_service_info(type_, name, timeout=2000)
+        if self._is_ours(info):
+            self.name = name
+            self._publish(info)
+
+    # Active poll: re-query the service (fresh mDNS query) and re-publish so SignalK
+    # stays live even when the device sends no unsolicited updates.
+    def poll(self):
+        if not self.name:
+            return
+        info = self.zc.get_service_info("_ewelink._tcp.local.", self.name, timeout=2000)
+        if self._is_ours(info):
+            self._publish(info)
+
+    def _publish(self, info):
+        props = _props(info)
+        try:
+            p = decrypt(props) if props.get("encrypt") in ("true", True) else {}
+        except Exception as e:
+            log("decrypt failed:", e); return
         out = {}
         if "power" in p:   out["power"] = float(p["power"])       # W
         if "voltage" in p: out["voltage"] = float(p["voltage"])   # V
@@ -77,13 +92,11 @@ class Listener:
         if out:
             log("published", out)
 
-    # zeroconf callbacks
-    def add_service(self, zc, type_, name):    self._handle(zc, type_, name)
-    def update_service(self, zc, type_, name): self._handle(zc, type_, name)
-    def remove_service(self, zc, type_, name): pass
-
 def main():
-    client = mqtt.Client()
+    try:
+        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1)
+    except Exception:
+        client = mqtt.Client()
     client.will_set(f"{PREFIX}/online", "0", retain=True)
     while True:
         try:
@@ -96,10 +109,13 @@ def main():
     log(f"listening for POWR3 {DEVICE_ID} over LAN -> {PREFIX}/* on {MQTT_HOST}:{MQTT_PORT}")
 
     zc = Zeroconf()
-    ServiceBrowser(zc, "_ewelink._tcp.local.", Listener(client))
+    listener = Listener(client, zc)
+    ServiceBrowser(zc, "_ewelink._tcp.local.", listener)
     try:
         while True:
-            time.sleep(3600)
+            time.sleep(15)          # poll cadence — keeps electrical.ac.shore.* live
+            listener.poll()
+            client.publish(f"{PREFIX}/online", "1", retain=True)
     finally:
         zc.close()
 
