@@ -13,7 +13,7 @@ Env:
   MQTT_PORT       default 1883
   TOPIC_PREFIX    default maracaibo/sonoff/powr3
 """
-import os, sys, json, time, hashlib, base64, threading
+import os, sys, json, time, hashlib, base64, urllib.request
 from Crypto.Cipher import AES
 from zeroconf import Zeroconf, ServiceBrowser
 import paho.mqtt.client as mqtt
@@ -38,6 +38,17 @@ def decrypt(props):
     pt = pt[: -pt[-1]]                                        # strip PKCS7 padding
     return json.loads(pt)
 
+def encrypt(params):
+    """AES-128-CBC encrypt a params dict with the device key (eWeLink LAN control)."""
+    key = hashlib.md5(DEVICE_KEY.encode()).digest()
+    iv = os.urandom(16)
+    data = json.dumps(params).encode()
+    pad = 16 - (len(data) % 16)
+    data += bytes([pad]) * pad
+    ct = AES.new(key, AES.MODE_CBC, iv).encrypt(data)
+    return base64.b64encode(iv).decode(), base64.b64encode(ct).decode()
+
+
 def _props(info):
     out = {}
     for k, v in (info.properties or {}).items():
@@ -52,9 +63,37 @@ class Listener:
         self.client = client
         self.zc = zc
         self.name = None          # our device's mDNS instance name, once discovered
+        self.addr = None          # device IP + port (for LAN control)
+        self.port = None
 
     def _is_ours(self, info):
-        return bool(info) and _props(info).get("id") == DEVICE_ID
+        if not info or _props(info).get("id") != DEVICE_ID:
+            return False
+        try:
+            addrs = info.parsed_addresses()
+            if addrs: self.addr = addrs[0]; self.port = info.port
+        except Exception:
+            pass
+        return True
+
+    # LAN control: POST an AES-encrypted {switch:on/off} to the device (offline).
+    def control(self, on):
+        if not self.addr:
+            log("control: device address not yet discovered"); return False
+        iv_b64, data_b64 = encrypt({"switch": "on" if on else "off"})
+        body = json.dumps({
+            "sequence": str(int(time.time() * 1000)), "deviceid": DEVICE_ID,
+            "selfApikey": "123", "iv": iv_b64, "encrypt": True, "data": data_b64,
+        }).encode()
+        url = f"http://{self.addr}:{self.port}/zeroconf/switch"
+        try:
+            req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+            resp = json.loads(urllib.request.urlopen(req, timeout=5).read())
+            log(f"control switch={'on' if on else 'off'} -> {resp}")
+            self.poll()                                   # publish the confirmed state back
+            return resp.get("error") == 0
+        except Exception as e:
+            log("control failed:", e); return False
 
     # eWeLink pushes are unreliable; we poll (re-query) instead. But still grab the
     # instance name from discovery so poll() knows what to re-query.
@@ -111,6 +150,15 @@ def main():
     zc = Zeroconf()
     listener = Listener(client, zc)
     ServiceBrowser(zc, "_ewelink._tcp.local.", listener)
+
+    # control: MQTT <prefix>/cmd/switch = on/off -> LAN control the POWR3 relay
+    def on_message(cl, ud, msg):
+        cmd = msg.payload.decode(errors="ignore").strip().lower()
+        log(f"cmd/switch = {cmd}")
+        listener.control(cmd in ("on", "1", "true"))
+    client.on_message = on_message
+    client.subscribe(f"{PREFIX}/cmd/switch")
+
     try:
         while True:
             time.sleep(15)          # poll cadence — keeps electrical.ac.shore.* live
