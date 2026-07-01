@@ -1,0 +1,2 @@
+# Secrets — DEVICE_KEY lives here, never commit
+.env

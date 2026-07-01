@@ -1,0 +1,9 @@
+services:
+  sonoff-powr3:
+    image: dmtamsen/privhub:maracaibo-sonoff
+    build: .
+    container_name: maracaibo-sonoff
+    restart: unless-stopped
+    # host networking so mDNS multicast reaches the POWR3 on the boat LAN
+    network_mode: host
+    env_file: .env
