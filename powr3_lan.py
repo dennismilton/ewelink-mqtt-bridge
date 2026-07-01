@@ -13,7 +13,7 @@ Env:
   MQTT_PORT       default 1883
   TOPIC_PREFIX    default maracaibo/sonoff/powr3
 """
-import os, sys, json, time, hashlib, base64, urllib.request
+import os, sys, json, time, hashlib, base64, secrets, urllib.request
 from Crypto.Cipher import AES
 from zeroconf import Zeroconf, ServiceBrowser
 import paho.mqtt.client as mqtt
@@ -23,6 +23,13 @@ DEVICE_KEY = os.environ.get("DEVICE_KEY", "").strip()
 MQTT_HOST = os.environ.get("MQTT_HOST", "127.0.0.1")
 MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
 PREFIX = os.environ.get("TOPIC_PREFIX", "maracaibo/sonoff/powr3").rstrip("/")
+# Cloud read for power/voltage/current — the POWR3 does NOT report these reliably over
+# LAN (Sonoff limitation). Switch state + control stay on LAN (offline). If no token,
+# power just isn't published (switch + control still work).
+CLOUD_TOKEN = os.environ.get("EWELINK_TOKEN", "").strip()
+CLOUD_APPID = os.environ.get("EWELINK_APPID", "K0OCDSvIaBWdEaU4zxlKEwk26kmshoXK").strip()
+CLOUD_REGION = os.environ.get("EWELINK_REGION", "eu").strip()
+CLOUD_INTERVAL = int(os.environ.get("CLOUD_INTERVAL", "30"))
 if not DEVICE_ID or not DEVICE_KEY:
     sys.exit("DEVICE_ID and DEVICE_KEY are required")
 
@@ -116,20 +123,47 @@ class Listener:
             self._publish(info)
 
     def _publish(self, info):
+        # LAN mDNS carries the SWITCH state reliably; power/V/A over LAN are unreliable
+        # (frozen/thresholded) so we take those from the cloud instead.
         props = _props(info)
         try:
             p = decrypt(props) if props.get("encrypt") in ("true", True) else {}
         except Exception as e:
             log("decrypt failed:", e); return
-        out = {}
-        if "power" in p:   out["power"] = float(p["power"])       # W
-        if "voltage" in p: out["voltage"] = float(p["voltage"])   # V
-        if "current" in p: out["current"] = float(p["current"])   # A
-        if "switch" in p:  out["switch"] = 1 if p["switch"] == "on" else 0
-        for k, v in out.items():
-            self.client.publish(f"{PREFIX}/{k}", str(v), qos=0, retain=True)
-        if out:
-            log("published", out)
+        if "switch" in p:
+            self.client.publish(f"{PREFIX}/switch", str(1 if p["switch"] == "on" else 0), qos=0, retain=True)
+
+    # Cloud read of power/voltage/current (the reliable source for those).
+    def cloud_poll(self):
+        if not CLOUD_TOKEN:
+            return
+        url = f"https://{CLOUD_REGION}-apia.coolkit.cc/v2/device/thing"
+        req = urllib.request.Request(url, headers={
+            "Content-Type": "application/json", "X-CK-Appid": CLOUD_APPID,
+            "X-CK-Nonce": secrets.token_hex(4), "Authorization": f"Bearer {CLOUD_TOKEN}",
+        })
+        try:
+            d = json.load(urllib.request.urlopen(req, timeout=10))
+        except Exception as e:
+            log("cloud poll failed:", e); return
+        if d.get("error"):
+            log("cloud error", d.get("error"), d.get("msg", "")); return
+        for t in (d.get("data") or {}).get("thingList") or []:
+            it = t.get("itemData", {})
+            if it.get("deviceid") != DEVICE_ID:
+                continue
+            p = it.get("params", {})
+            out = {}
+            for k in ("power", "voltage", "current"):
+                if k in p:
+                    try: out[k] = float(p[k])
+                    except Exception: pass
+            if "switch" in p:
+                out["switch"] = 1 if p["switch"] == "on" else 0
+            for k, v in out.items():
+                self.client.publish(f"{PREFIX}/{k}", str(v), qos=0, retain=True)
+            if out:
+                log("cloud published", out)
 
 def main():
     try:
@@ -159,10 +193,17 @@ def main():
     client.on_message = on_message
     client.subscribe(f"{PREFIX}/cmd/switch")
 
+    if CLOUD_TOKEN:
+        log(f"cloud power poll enabled ({CLOUD_REGION}, every {CLOUD_INTERVAL}s)")
+        listener.cloud_poll()
+    n = 0
     try:
         while True:
-            time.sleep(15)          # poll cadence — keeps electrical.ac.shore.* live
+            time.sleep(15)          # LAN switch state cadence
             listener.poll()
+            n += 1
+            if CLOUD_TOKEN and (n * 15) % CLOUD_INTERVAL < 15:   # ~every CLOUD_INTERVAL
+                listener.cloud_poll()
             client.publish(f"{PREFIX}/online", "1", retain=True)
     finally:
         zc.close()
