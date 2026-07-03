@@ -19,7 +19,7 @@ between the local and cloud APIs:
     `/zeroconf/switch` endpoint (device IP + port discovered via mDNS). Works with
     no internet.
 
-- **Cloud path (poll, ~30s)** — eWeLink/CoolKit v2 cloud API. Used for
+- **Cloud path (poll, ~60s)** — eWeLink/CoolKit v2 cloud API. Used for
   **power / voltage / current** only.
   **Why:** the POWR3 does **not** reliably report live power/voltage/current over the
   eWeLink LAN protocol — Sonoff's firmware only pushes those over LAN on large
@@ -90,7 +90,8 @@ Set these in `.env` on the Pi (copy from [`.env.example`](.env.example)).
 | `EWELINK_TOKEN`   | no  | — | Manual access token — **secret**; legacy fallback, not auto-refreshed |
 | `EWELINK_TOKEN_APPID` | no | `EWELINK_APPID`, else `K0OCDSvIaBWdEaU4zxlKEwk26kmshoXK` | Appid the manual token was issued under |
 | `EWELINK_REGION`  | no  | `eu` | CoolKit API region (OAuth stores the real region in the token file) |
-| `CLOUD_INTERVAL`  | no  | `30` | Cloud poll interval (seconds) |
+| `CLOUD_INTERVAL`  | no  | `60` | Cloud poll interval (seconds) |
+| `CLOUD_MAX_FAILS` | no  | `10` | Consecutive failed cloud polls before the retained `power`/`voltage`/`current` topics are cleared (so dashboards don't show frozen readings as live; switch stays — LAN owns it). Publishing resumes automatically when the cloud comes back. |
 
 The bridge exits if `DEVICE_ID` or `DEVICE_KEY` is missing. LAN switch state is polled
 every 15s.

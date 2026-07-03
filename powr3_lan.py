@@ -7,7 +7,7 @@ eWeLink LAN (firmware only pushes on large threshold changes):
   • LAN  — switch STATE + relay CONTROL, fully OFFLINE. We decrypt the mDNS state and
            publish it; a cmd topic drives control by POSTing to the device's
            /zeroconf/switch (encrypted) at the IP+port discovered via mDNS.
-  • CLOUD— power / voltage / current, polled ~30s from the eWeLink cloud (needs a
+  • CLOUD— power / voltage / current, polled ~60s from the eWeLink cloud (needs a
            CoolKit v2 access token in EWELINK_TOKEN). Skipped if no token.
 signalk-mqtt-sensors maps the published topics into SignalK (electrical.ac.shore.*).
 
@@ -54,7 +54,10 @@ MANUAL_TOKEN = os.environ.get("EWELINK_TOKEN", "").strip()
 MANUAL_APPID = (os.environ.get("EWELINK_TOKEN_APPID", "").strip()
                 or CLOUD_APPID or "K0OCDSvIaBWdEaU4zxlKEwk26kmshoXK")
 CLOUD_REGION = os.environ.get("EWELINK_REGION", "eu").strip()
-CLOUD_INTERVAL = int(os.environ.get("CLOUD_INTERVAL", "30"))
+CLOUD_INTERVAL = int(os.environ.get("CLOUD_INTERVAL", "60"))
+# After this many consecutive failed cloud polls, clear the retained power/voltage/
+# current topics so MQTT/SignalK don't keep showing stale readings as live.
+CLOUD_MAX_FAILS = int(os.environ.get("CLOUD_MAX_FAILS", "10"))
 
 log = lambda *a: print(*a, flush=True)
 
@@ -246,6 +249,7 @@ class Listener:
         self.client = client
         self.zc = zc
         self.auth = auth
+        self.cloud_fails = 0      # consecutive failed cloud polls
         self.name = None          # our device's mDNS instance name, once discovered
         self.addr = None          # device IP + port (for LAN control)
         self.port = None
@@ -310,6 +314,17 @@ class Listener:
         if "switch" in p:
             self.client.publish(f"{PREFIX}/switch", str(1 if p["switch"] == "on" else 0), qos=0, retain=True)
 
+    # No cloud data for CLOUD_MAX_FAILS polls in a row -> delete the retained
+    # power/voltage/current messages (empty retained payload clears them on the
+    # broker) so dashboards don't show frozen readings as live. Switch stays —
+    # the LAN path owns it.
+    def _cloud_fail(self):
+        self.cloud_fails += 1
+        if self.cloud_fails == CLOUD_MAX_FAILS:
+            log(f"cloud data stale ({CLOUD_MAX_FAILS} failed polls) — clearing retained power/voltage/current")
+            for k in ("power", "voltage", "current"):
+                self.client.publish(f"{PREFIX}/{k}", "", qos=0, retain=True)
+
     # Cloud read of power/voltage/current (the reliable source for those).
     def cloud_poll(self, _retry=True):
         creds = self.auth.credentials()
@@ -319,12 +334,13 @@ class Listener:
         try:
             d = _cloud_req(f"{_api_base(region)}/v2/device/thing", bearer=at, appid=appid)
         except Exception as e:
-            log("cloud poll failed:", e); return
+            log("cloud poll failed:", e); self._cloud_fail(); return
         if d.get("error"):
             # 401/402 = invalid/expired token -> refresh once and retry
             if d["error"] in (401, 402) and _retry and self.auth.invalidate():
                 return self.cloud_poll(_retry=False)
-            log("cloud error", d.get("error"), d.get("msg", "")); return
+            log("cloud error", d.get("error"), d.get("msg", "")); self._cloud_fail(); return
+        published = False
         for t in (d.get("data") or {}).get("thingList") or []:
             it = t.get("itemData", {})
             if it.get("deviceid") != DEVICE_ID:
@@ -340,7 +356,14 @@ class Listener:
             for k, v in out.items():
                 self.client.publish(f"{PREFIX}/{k}", str(v), qos=0, retain=True)
             if out:
+                published = True
                 log("cloud published", out)
+        if published:
+            if self.cloud_fails >= CLOUD_MAX_FAILS:
+                log("cloud data back after outage")
+            self.cloud_fails = 0
+        else:
+            log("cloud poll: our device not in response"); self._cloud_fail()
 
 def main():
     if not DEVICE_ID or not DEVICE_KEY:
