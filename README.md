@@ -19,15 +19,37 @@ between the local and cloud APIs:
     `/zeroconf/switch` endpoint (device IP + port discovered via mDNS). Works with
     no internet.
 
-- **Cloud path (poll, ~30s)** — eWeLink/CoolKit v2 cloud API, using a token supplied
-  in `EWELINK_TOKEN`. Used for **power / voltage / current** only.
+- **Cloud path (poll, ~30s)** — eWeLink/CoolKit v2 cloud API. Used for
+  **power / voltage / current** only.
   **Why:** the POWR3 does **not** reliably report live power/voltage/current over the
   eWeLink LAN protocol — Sonoff's firmware only pushes those over LAN on large
   threshold changes, so LAN readings go stale/frozen. The cloud poll is the reliable
   source for those three values.
 
-If `EWELINK_TOKEN` is unset, power/voltage/current are simply not published; switch
-state and relay control still work fully offline over LAN.
+If no cloud credentials are configured, power/voltage/current are simply not
+published; switch state and relay control still work fully offline over LAN.
+
+## Cloud auth — OAuth2.0 (preferred) or manual token (fallback)
+
+**OAuth2.0** (eWeLink app-dev license from [dev.ewelink.cc](https://dev.ewelink.cc)):
+set `EWELINK_APPID` + `EWELINK_APPSECRET` + `EWELINK_REDIRECT_URL` (must exactly match
+the redirect URL registered with the app), then run the one-time login:
+
+```
+python powr3_lan.py auth        # or: docker compose run --rm sonoff-powr3 python powr3_lan.py auth
+```
+
+It prints an eWeLink login URL; open it in a browser, log in, and the local callback
+server (port from `EWELINK_REDIRECT_URL`) captures the authorization code — note the
+code is only valid **30 seconds**, so the exchange happens immediately. Tokens land in
+`EWELINK_TOKEN_FILE` (compose mounts `./data:/data`) and the bridge **auto-refreshes**
+them (access token 30 days, refresh token 60 days), plus retries a refresh on any
+401/402 from the API. If the auth machine isn't the Pi, copy the token file over to
+`./data/` afterwards.
+
+**Manual token fallback:** a hand-made access token in `EWELINK_TOKEN` (issued under
+`EWELINK_TOKEN_APPID`) is used whenever OAuth tokens are absent or refresh fails. It
+is *not* auto-refreshed — it dies when it expires.
 
 ## MQTT topics
 
@@ -61,9 +83,13 @@ Set these in `.env` on the Pi (copy from [`.env.example`](.env.example)).
 | `MQTT_HOST`       | no  | `127.0.0.1` | MQTT broker host |
 | `MQTT_PORT`       | no  | `1883` | MQTT broker port |
 | `TOPIC_PREFIX`    | no  | `maracaibo/sonoff/powr3` | MQTT topic prefix |
-| `EWELINK_TOKEN`   | no  | — | CoolKit v2 access token — **secret**; enables cloud power poll |
-| `EWELINK_APPID`   | no  | `K0OCDSvIaBWdEaU4zxlKEwk26kmshoXK` | CoolKit appid |
-| `EWELINK_REGION`  | no  | `eu` | CoolKit API region |
+| `EWELINK_APPID`   | no  | — | OAuth2.0 app id (dev.ewelink.cc) — enables OAuth cloud auth |
+| `EWELINK_APPSECRET` | no | — | OAuth2.0 app secret — **secret** |
+| `EWELINK_REDIRECT_URL` | no | `http://127.0.0.1:8000/callback` | Redirect URL registered with the OAuth app |
+| `EWELINK_TOKEN_FILE` | no | `/data/ewelink_tokens.json` | Where OAuth tokens persist (compose mounts `./data:/data`) |
+| `EWELINK_TOKEN`   | no  | — | Manual access token — **secret**; legacy fallback, not auto-refreshed |
+| `EWELINK_TOKEN_APPID` | no | `EWELINK_APPID`, else `K0OCDSvIaBWdEaU4zxlKEwk26kmshoXK` | Appid the manual token was issued under |
+| `EWELINK_REGION`  | no  | `eu` | CoolKit API region (OAuth stores the real region in the token file) |
 | `CLOUD_INTERVAL`  | no  | `30` | Cloud poll interval (seconds) |
 
 The bridge exits if `DEVICE_ID` or `DEVICE_KEY` is missing. LAN switch state is polled
@@ -71,8 +97,9 @@ every 15s.
 
 ## Secrets
 
-`DEVICE_KEY` and `EWELINK_TOKEN` are secrets — they live only in `.env` on the Pi and
-are never committed (`.env` is `.gitignore`d). Do not put them in this repo.
+`DEVICE_KEY`, `EWELINK_APPSECRET`, `EWELINK_TOKEN` and the token file under `data/`
+are secrets — they live only on the Pi and are never committed (`.env` and `data/`
+are `.gitignore`d). Do not put them in this repo.
 
 ## Deploy (build on Mac, pull on Pi — same model as vfc)
 

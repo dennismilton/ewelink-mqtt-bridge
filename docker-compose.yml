@@ -7,3 +7,6 @@ services:
     # host networking so mDNS multicast reaches the POWR3 on the boat LAN
     network_mode: host
     env_file: .env
+    # OAuth tokens persist here (access/refresh tokens, auto-refreshed)
+    volumes:
+      - ./data:/data

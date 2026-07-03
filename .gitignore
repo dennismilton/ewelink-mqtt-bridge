@@ -1,2 +1,5 @@
 # Secrets — DEVICE_KEY lives here, never commit
 .env
+# OAuth access/refresh tokens
+data/
+__pycache__/
