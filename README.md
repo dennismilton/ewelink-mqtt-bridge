@@ -111,3 +111,20 @@ are `.gitignore`d). Do not put them in this repo.
 ```
 
 `network_mode: host` is required so mDNS multicast reaches the POWR3 on the boat LAN.
+
+## Why there is a `json` topic as well as the per-key ones
+
+`maracaibo/sonoff/powr3/{power,voltage,current,switch}` carry a **bare** payload
+(`134.97`). `signalk-mqtt-sensors` has no numeric conversion for sensor type
+`other` — it passes the payload straight through — so those values reached
+SignalK as **strings**. They logged to InfluxDB happily and then could not be
+read back: the History API answers `unsupported mean iterator type:
+*query.stringInterruptIterator`, because a string cannot be averaged. The tank
+topics never had this problem precisely because they arrive as JSON, where the
+extracted value is already a number.
+
+So `cloud_poll` also publishes `maracaibo/sonoff/powr3/json`
+(`{"power":134.97,"voltage":233.37,"current":0.78,"switch":1}`, retained) and
+SignalK maps `electrical.ac.shore.*` from **that** topic with `json_path`. The
+per-key topics are unchanged and still published, so anything else reading them
+keeps working — this adds a typed path, it does not replace the old one.

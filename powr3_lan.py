@@ -355,6 +355,20 @@ class Listener:
                 out["switch"] = 1 if p["switch"] == "on" else 0
             for k, v in out.items():
                 self.client.publish(f"{PREFIX}/{k}", str(v), qos=0, retain=True)
+            # ALSO publish the whole reading as JSON, and this is about TYPES, not
+            # convenience. The per-key topics carry a bare string ("134.97"), and
+            # signalk-mqtt-sensors has no numeric conversion for sensor type
+            # "other" — it passes the payload straight through — so shore power,
+            # voltage and current landed in SignalK as STRINGS. They logged to
+            # InfluxDB fine and then could not be read back: the History API
+            # answered `unsupported mean iterator type: *query.stringInterruptIterator`,
+            # because you cannot average a string. The tank topics never had this
+            # problem precisely because they arrive as JSON, where the extracted
+            # value is already a number. Mapping shore from this topic with a
+            # json_path gives the plugin a real float. The per-key topics stay
+            # exactly as they were, so nothing else that reads them breaks.
+            if out:
+                self.client.publish(f"{PREFIX}/json", json.dumps(out), qos=0, retain=True)
             if out:
                 published = True
                 log("cloud published", out)
