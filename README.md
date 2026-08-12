@@ -1,4 +1,4 @@
-# maracaibo-sonoff
+# ewelink-mqtt-bridge
 
 Bridge between **eWeLink/Sonoff devices** and MQTT — LAN-first, cloud-fallback —
 built for the vessel *Maracaibo*'s SignalK dashboard and generic enough for any
