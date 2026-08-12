@@ -58,6 +58,12 @@ CLOUD_INTERVAL = int(os.environ.get("CLOUD_INTERVAL", "60"))
 # After this many consecutive failed cloud polls, clear the retained power/voltage/
 # current topics so MQTT/SignalK don't keep showing stale readings as live.
 CLOUD_MAX_FAILS = int(os.environ.get("CLOUD_MAX_FAILS", "10"))
+# SECOND DEVICE: an eWeLink 4CH (uiid 4) that lives on ANOTHER network, so unlike
+# the POWR3 there is no LAN path at all — state AND control both ride the cloud.
+# Same account, same tokens, same /v2/device/thing poll we already make; the 4CH
+# rows just fall out of the response we were throwing away.
+EWE4_ID = os.environ.get("EWE4_ID", "").strip()
+EWE4_PREFIX = os.environ.get("EWE4_PREFIX", "maracaibo/sonoff/ewe4").rstrip("/")
 
 log = lambda *a: print(*a, flush=True)
 
@@ -343,6 +349,19 @@ class Listener:
         published = False
         for t in (d.get("data") or {}).get("thingList") or []:
             it = t.get("itemData", {})
+            if EWE4_ID and it.get("deviceid") == EWE4_ID:
+                # one JSON payload, numeric values — per-key string topics are how
+                # shore power became unaverageable strings in Influx (see below)
+                pr = it.get("params", {}) or {}
+                out4 = {"online": 1 if it.get("online") else 0}
+                for sw in pr.get("switches") or []:
+                    o = sw.get("outlet")
+                    if o is not None:
+                        out4[f"ch{o + 1}"] = 1 if sw.get("switch") == "on" else 0
+                self.client.publish(f"{EWE4_PREFIX}/json", json.dumps(out4), qos=0, retain=True)
+                published = True
+                log("cloud published ewe4", out4)
+                continue
             if it.get("deviceid") != DEVICE_ID:
                 continue
             p = it.get("params", {})
@@ -402,13 +421,48 @@ def main():
     listener = Listener(client, zc, auth)
     ServiceBrowser(zc, "_ewelink._tcp.local.", listener)
 
-    # control: MQTT <prefix>/cmd/switch = on/off -> LAN control the POWR3 relay
+    # control:
+    #   <prefix>/cmd/switch        = on/off -> LAN control of the POWR3 relay
+    #   <ewe4 prefix>/cmd/ch[1-4]  = on/off -> CLOUD control of the 4CH (it is on
+    #                                another network; the cloud is the only path)
+    def _ewe4_control(ch, on):
+        creds = auth.credentials()
+        if not creds:
+            log("ewe4 cmd ignored — no cloud credentials"); return
+        at, appid, region = creds
+        try:
+            d = _cloud_req(f"{_api_base(region)}/v2/device/thing/status",
+                body={"type": 1, "id": EWE4_ID,
+                      "params": {"switches": [{"switch": "on" if on else "off",
+                                               "outlet": ch - 1}]}},
+                bearer=at, appid=appid)
+            if d.get("error"):
+                log("ewe4 control error", d.get("error"), d.get("msg", "")); return
+            log(f"ewe4 ch{ch} -> {'on' if on else 'off'}")
+            # confirm quickly so the dashboard's confirmed-state render is not a
+            # full poll interval behind the throw
+            listener.cloud_poll()
+        except Exception as e:
+            log("ewe4 control failed:", e)
+
     def on_message(cl, ud, msg):
         cmd = msg.payload.decode(errors="ignore").strip().lower()
+        if EWE4_ID and msg.topic.startswith(f"{EWE4_PREFIX}/cmd/ch"):
+            try:
+                ch = int(msg.topic.rsplit("ch", 1)[1])
+            except ValueError:
+                return
+            if 1 <= ch <= 4:
+                log(f"ewe4 cmd ch{ch} = {cmd}")
+                _ewe4_control(ch, cmd in ("on", "1", "true"))
+            return
         log(f"cmd/switch = {cmd}")
         listener.control(cmd in ("on", "1", "true"))
     client.on_message = on_message
     client.subscribe(f"{PREFIX}/cmd/switch")
+    if EWE4_ID:
+        client.subscribe(f"{EWE4_PREFIX}/cmd/+")
+        log(f"ewe4 {EWE4_ID} bridged: {EWE4_PREFIX}/json + cmd/ch1..4 (cloud)")
 
     cloud = auth.credentials() is not None
     if cloud:
