@@ -1,118 +1,85 @@
 #!/usr/bin/env python3
-"""Sonoff POWR3 <-> MQTT bridge — HYBRID (LAN for switch+control, cloud for power).
+"""eWeLink/Sonoff <-> MQTT bridge. LAN-first, cloud-fallback, push not poll.
 
-The POWR3 advertises over mDNS (_ewelink._tcp) with params AES-encrypted using the
-device key. Two paths, because the POWR3 does NOT reliably report live power/V/A over
-eWeLink LAN (firmware only pushes on large threshold changes):
-  • LAN  — switch STATE + relay CONTROL, fully OFFLINE. We decrypt the mDNS state and
-           publish it; a cmd topic drives control by POSTing to the device's
-           /zeroconf/switch (encrypted) at the IP+port discovered via mDNS.
-  • CLOUD— power / voltage / current, polled ~60s from the eWeLink cloud (needs a
-           CoolKit v2 access token in EWELINK_TOKEN). Skipped if no token.
-signalk-mqtt-sensors maps the published topics into SignalK (electrical.ac.shore.*).
+THE CONTRACT (one paragraph): every device in DEVICES follows the same rule —
+if mDNS has discovered it on THIS network, LAN owns it: state comes off the
+encrypted mDNS records, control is an AES-encrypted POST to the device, and a
+LAN failure is a logged failure, never a silent cloud retry. A device the
+bridge has NOT discovered routes to the eWeLink cloud for both. Discovery can
+UNDISCOVER (mDNS goodbye, or repeated LAN poll misses), at which point the
+cloud resumes seamlessly. State is PUSHED on both routes — mDNS updates on LAN,
+the eWeLink WebSocket on cloud — with a slow REST poll kept only to reconcile
+missed pushes and to fetch POWR3 power/V/A, which nothing streams. All state
+leaves through ONE publisher to retained MQTT topics, so downstream (SignalK,
+dashboards, Influx) never knows or cares which route delivered.
 
-Cloud auth (preferred): eWeLink OAuth2.0 app (dev.ewelink.cc appid+secret). One-time
-`python powr3_lan.py auth` obtains access+refresh tokens; the bridge persists them in
-EWELINK_TOKEN_FILE and auto-refreshes (at 30d / rt 60d). Fallback: a manually-made
-access token in EWELINK_TOKEN (bound to EWELINK_TOKEN_APPID) is used if OAuth tokens
-are absent or refresh fails.
-
-Env:
-  DEVICE_ID            eWeLink deviceid (e.g. 100155ab01)
-  DEVICE_KEY           eWeLink devicekey (SECRET) — from the cloud API once
-  EWELINK_APPID        OAuth2.0 app id from dev.ewelink.cc
-  EWELINK_APPSECRET    OAuth2.0 app secret (SECRET)
-  EWELINK_REDIRECT_URL redirect URL registered with the OAuth app,
-                       default http://127.0.0.1:8000/callback
-  EWELINK_TOKEN_FILE   where OAuth tokens persist, default /data/ewelink_tokens.json
-  EWELINK_TOKEN        manual access token (SECRET) — legacy fallback
-  EWELINK_TOKEN_APPID  appid the manual token was issued under
-  EWELINK_REGION       cloud region, default eu
-  MQTT_HOST            default 127.0.0.1
-  MQTT_PORT            default 1883
-  TOPIC_PREFIX         default maracaibo/sonoff/powr3
+Config is env-driven; see .env.example and README.md. `python powr3_lan.py auth`
+runs the one-time OAuth login.
 """
-import os, sys, json, time, hashlib, hmac, base64, secrets, urllib.request, urllib.parse
+import os, sys, json, time, hashlib, hmac, base64, secrets, threading
+import urllib.request, urllib.parse
 from Crypto.Cipher import AES
 from zeroconf import Zeroconf, ServiceBrowser
 import paho.mqtt.client as mqtt
-import threading
 try:
     import websocket                      # cloud push (websocket-client)
 except ImportError:                       # bridge still works poll-only without it
     websocket = None
 
-DEVICE_ID = os.environ.get("DEVICE_ID", "").strip()
-DEVICE_KEY = os.environ.get("DEVICE_KEY", "").strip()
-MQTT_HOST = os.environ.get("MQTT_HOST", "127.0.0.1")
-MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
-PREFIX = os.environ.get("TOPIC_PREFIX", "maracaibo/sonoff/powr3").rstrip("/")
-# Cloud read for power/voltage/current — the POWR3 does NOT report these reliably over
-# LAN (Sonoff limitation). Switch state + control stay on LAN (offline). If no cloud
-# credentials, power just isn't published (switch + control still work).
-CLOUD_APPID = os.environ.get("EWELINK_APPID", "").strip()
-CLOUD_APPSECRET = os.environ.get("EWELINK_APPSECRET", "").strip()
-REDIRECT_URL = os.environ.get("EWELINK_REDIRECT_URL", "http://127.0.0.1:8000/callback").strip()
-TOKEN_FILE = os.environ.get("EWELINK_TOKEN_FILE", "/data/ewelink_tokens.json").strip()
-# Legacy manual token — access token bound to whatever appid it was issued under.
-MANUAL_TOKEN = os.environ.get("EWELINK_TOKEN", "").strip()
-MANUAL_APPID = (os.environ.get("EWELINK_TOKEN_APPID", "").strip()
-                or CLOUD_APPID or "K0OCDSvIaBWdEaU4zxlKEwk26kmshoXK")
-CLOUD_REGION = os.environ.get("EWELINK_REGION", "eu").strip()
-CLOUD_INTERVAL = int(os.environ.get("CLOUD_INTERVAL", "60"))
-# After this many consecutive failed cloud polls, clear the retained power/voltage/
-# current topics so MQTT/SignalK don't keep showing stale readings as live.
-CLOUD_MAX_FAILS = int(os.environ.get("CLOUD_MAX_FAILS", "10"))
-# SECOND DEVICE: an eWeLink 4CH (uiid 4) that lives on ANOTHER network, so unlike
-# the POWR3 there is no LAN path at all — state AND control both ride the cloud.
-# Same account, same tokens, same /v2/device/thing poll we already make; the 4CH
-# rows just fall out of the response we were throwing away.
-EWE4_ID = os.environ.get("EWE4_ID", "").strip()
-EWE4_KEY = os.environ.get("EWE4_KEY", "").strip()
-EWE4_PREFIX = os.environ.get("EWE4_PREFIX", "maracaibo/sonoff/ewe4").rstrip("/")
+env = lambda k, d="": os.environ.get(k, d).strip()
 
-# THE DEVICE REGISTRY — every eWeLink device this bridge owns, each with the
-# same contract (Dennis: "support both on all ewe devices — LAN first, then
-# cloud"): if mDNS has discovered the device on OUR network, state and control
-# go direct (no internet); otherwise both fall back to the cloud. A device that
-# moves onto the boat WiFi goes offline-capable automatically the moment mDNS
-# sees it — no config change.
+MQTT_HOST = env("MQTT_HOST", "127.0.0.1")
+MQTT_PORT = int(env("MQTT_PORT", "1883"))
+CLOUD_APPID = env("EWELINK_APPID")
+CLOUD_APPSECRET = env("EWELINK_APPSECRET")
+REDIRECT_URL = env("EWELINK_REDIRECT_URL", "http://127.0.0.1:8000/callback")
+TOKEN_FILE = env("EWELINK_TOKEN_FILE", "/data/ewelink_tokens.json")
+MANUAL_TOKEN = env("EWELINK_TOKEN")       # legacy fallback, not auto-refreshed
+MANUAL_APPID = env("EWELINK_TOKEN_APPID") or CLOUD_APPID or "K0OCDSvIaBWdEaU4zxlKEwk26kmshoXK"
+CLOUD_REGION = env("EWELINK_REGION", "eu")
+CLOUD_INTERVAL = int(env("CLOUD_INTERVAL", "60"))
+CLOUD_MAX_FAILS = int(env("CLOUD_MAX_FAILS", "10"))
+LAN_POLL_S = 15                           # LAN re-query cadence
+LAN_MISS_LIMIT = 4                        # poll misses before we UNDISCOVER
+
+# ── the device registry ──────────────────────────────────────────────────────
+# kind 'single': one relay, {switch:on/off}, state topics <prefix>/<key>,
+#                power/V/A from cloud only (LAN readings freeze — firmware).
+# kind 'multi':  N relays, {switches:[{switch,outlet}]}, ONE numeric-JSON state
+#                topic <prefix>/json (strings cannot be averaged downstream).
 DEVICES = {}
-if DEVICE_ID:
-    DEVICES[DEVICE_ID] = {"id": DEVICE_ID, "key": DEVICE_KEY, "prefix": PREFIX,
-                          "kind": "single"}
-if EWE4_ID:
-    DEVICES[EWE4_ID] = {"id": EWE4_ID, "key": EWE4_KEY, "prefix": EWE4_PREFIX,
-                        "kind": "multi", "channels": 4}
+if env("DEVICE_ID"):
+    DEVICES[env("DEVICE_ID")] = {
+        "id": env("DEVICE_ID"), "key": env("DEVICE_KEY"),
+        "prefix": env("TOPIC_PREFIX", "maracaibo/sonoff/powr3").rstrip("/"),
+        "kind": "single"}
+if env("EWE4_ID"):
+    DEVICES[env("EWE4_ID")] = {
+        "id": env("EWE4_ID"), "key": env("EWE4_KEY"),
+        "prefix": env("EWE4_PREFIX", "maracaibo/sonoff/ewe4").rstrip("/"),
+        "kind": "multi", "channels": 4}
 
 log = lambda *a: print(*a, flush=True)
 
-# ---------------------------------------------------------------- cloud auth
+# ── cloud: HTTP + auth ───────────────────────────────────────────────────────
 
 def _api_base(region):
-    tld = "cn" if region == "cn" else "cc"
-    return f"https://{region}-apia.coolkit.{tld}"
-
-def _sign(data: bytes) -> str:
-    """eWeLink v2 'Sign' auth: base64(HMAC-SHA256(appsecret, data))."""
-    return base64.b64encode(hmac.new(CLOUD_APPSECRET.encode(), data, hashlib.sha256).digest()).decode()
+    return f"https://{region}-apia.coolkit.{'cn' if region == 'cn' else 'cc'}"
 
 def _cloud_req(url, body=None, bearer=None, appid=None):
-    """Signed (body!=None, Sign) or Bearer request. Returns decoded JSON."""
+    """Signed (Sign, when no bearer) or Bearer request. Returns decoded JSON."""
     data = json.dumps(body).encode() if body is not None else None
-    auth = f"Bearer {bearer}" if bearer else f"Sign {_sign(data or b'')}"
+    auth = (f"Bearer {bearer}" if bearer else "Sign " + base64.b64encode(
+        hmac.new(CLOUD_APPSECRET.encode(), data or b"", hashlib.sha256).digest()).decode())
     req = urllib.request.Request(url, data=data, headers={
         "Content-Type": "application/json", "X-CK-Appid": appid or CLOUD_APPID,
-        "X-CK-Nonce": secrets.token_hex(4), "Authorization": auth,
-    })
+        "X-CK-Nonce": secrets.token_hex(4), "Authorization": auth})
     return json.load(urllib.request.urlopen(req, timeout=10))
 
 class CloudAuth:
     """OAuth token store with auto-refresh; manual EWELINK_TOKEN as fallback.
-
-    Token file: {at, rt, atExpiredTime, rtExpiredTime, region} (times = ms epoch).
-    """
-    REFRESH_MARGIN_MS = 24 * 3600 * 1000            # refresh 1 day before at expiry
+    Token file: {at, rt, atExpiredTime, rtExpiredTime, region} (ms epoch)."""
+    REFRESH_MARGIN_MS = 24 * 3600 * 1000
 
     def __init__(self):
         self.tok = None
@@ -136,7 +103,6 @@ class CloudAuth:
         return (self.tok or {}).get("region") or CLOUD_REGION
 
     def refresh(self):
-        """Exchange rt for a fresh at/rt. Returns True on success."""
         if not (self.tok and self.tok.get("rt") and CLOUD_APPID and CLOUD_APPSECRET):
             return False
         try:
@@ -146,17 +112,15 @@ class CloudAuth:
         if d.get("error"):
             log("token refresh error", d.get("error"), d.get("msg", "")); return False
         now = int(time.time() * 1000)
-        self.tok.update({
-            "at": d["data"]["at"], "rt": d["data"]["rt"],
-            "atExpiredTime": now + 30 * 86400 * 1000,   # at valid 30d, rt 60d
-            "rtExpiredTime": now + 60 * 86400 * 1000,
-        })
+        self.tok.update({"at": d["data"]["at"], "rt": d["data"]["rt"],
+                         "atExpiredTime": now + 30 * 86400 * 1000,
+                         "rtExpiredTime": now + 60 * 86400 * 1000})
         self.save()
         log("OAuth tokens refreshed")
         return True
 
     def credentials(self):
-        """Return (access_token, appid, region) or None. Refreshes when near expiry."""
+        """(access_token, appid, region) or None. Refreshes when near expiry."""
         if self.tok and self.tok.get("at"):
             now = int(time.time() * 1000)
             if now >= self.tok.get("atExpiredTime", 0) - self.REFRESH_MARGIN_MS:
@@ -167,20 +131,338 @@ class CloudAuth:
         return self._manual()
 
     def _manual(self):
-        if MANUAL_TOKEN:
-            return (MANUAL_TOKEN, MANUAL_APPID, CLOUD_REGION)
-        return None
+        return (MANUAL_TOKEN, MANUAL_APPID, CLOUD_REGION) if MANUAL_TOKEN else None
 
     def invalidate(self):
-        """Called on 401/402 from a data call — force a refresh attempt."""
+        """Force a refresh after a 401/402 from a data call."""
         if self.tok:
             self.tok["atExpiredTime"] = 0
             return self.refresh()
         return False
 
+# ── LAN crypto (eWeLink zeroconf protocol) ───────────────────────────────────
+
+def _aes(key_str):
+    return hashlib.md5(key_str.encode()).digest()
+
+def decrypt(props, devkey):
+    iv = base64.b64decode(props["iv"])
+    ct = base64.b64decode("".join(props.get(f"data{i}") or "" for i in (1, 2, 3, 4)))
+    pt = AES.new(_aes(devkey), AES.MODE_CBC, iv).decrypt(ct)
+    return json.loads(pt[: -pt[-1]])                       # strip PKCS7
+
+def encrypt(params, devkey):
+    iv = os.urandom(16)
+    data = json.dumps(params).encode()
+    data += bytes([16 - len(data) % 16]) * (16 - len(data) % 16)
+    ct = AES.new(_aes(devkey), AES.MODE_CBC, iv).encrypt(data)
+    return base64.b64encode(iv).decode(), base64.b64encode(ct).decode()
+
+def _props(info):
+    out = {}
+    for k, v in (info.properties or {}).items():
+        try:
+            out[k.decode()] = v.decode() if isinstance(v, bytes) else v
+        except Exception:
+            pass
+    return out
+
+# ── the bridge ───────────────────────────────────────────────────────────────
+
+class Bridge:
+    """One publisher, one router. Also the zeroconf ServiceBrowser listener."""
+
+    def __init__(self, client, zc, auth):
+        self.client = client
+        self.zc = zc
+        self.auth = auth
+        self.cloud_fails = 0
+        self.apikey = None                # account apikey (WS handshake), from device list
+        # LAN presence per device: name/addr/port + consecutive poll misses
+        self.lan = {d: {"name": None, "addr": None, "port": None, "miss": 0} for d in DEVICES}
+        self.last = {}                    # last multi-state, for offline stamps
+
+    # -- discovery ----------------------------------------------------------
+    def lan_active(self, did):
+        return bool(self.lan[did]["addr"]) if did in self.lan else False
+
+    def _undiscover(self, did, why):
+        st = self.lan[did]
+        if st["addr"]:
+            log(f"LAN lost {DEVICES[did]['prefix']} ({why}) — cloud resumes")
+        st.update(addr=None, port=None, miss=0)
+
+    def _match(self, info):
+        """Registry entry for an mDNS record (records addr/port), or None."""
+        if not info:
+            return None
+        cfg = DEVICES.get(_props(info).get("id"))
+        if cfg:
+            try:
+                addrs = info.parsed_addresses()
+                if addrs:
+                    self.lan[cfg["id"]].update(addr=addrs[0], port=info.port, miss=0)
+            except Exception:
+                pass
+        return cfg
+
+    # zeroconf callbacks — mDNS *is* the LAN push channel
+    def add_service(self, zc, type_, name):    self._seen(name)
+    def update_service(self, zc, type_, name): self._seen(name)
+
+    def remove_service(self, zc, type_, name):
+        for did, st in self.lan.items():
+            if st["name"] == name:
+                self._undiscover(did, "mDNS goodbye")
+
+    def _seen(self, name):
+        info = self.zc.get_service_info("_ewelink._tcp.local.", name, timeout=2000)
+        cfg = self._match(info)
+        if cfg:
+            if not self.lan[cfg["id"]]["name"]:
+                log(f"LAN discovered {cfg['prefix']} at {self.lan[cfg['id']]['addr']}")
+            self.lan[cfg["id"]]["name"] = name
+            self._lan_state(info, cfg)
+
+    def lan_poll(self):
+        """Re-query known devices so state stays fresh even without pushes — and
+        UNDISCOVER after LAN_MISS_LIMIT misses, so a device that left the network
+        hands back to the cloud instead of freezing as LAN-owned forever."""
+        for did, st in self.lan.items():
+            if not st["name"]:
+                continue
+            info = self.zc.get_service_info("_ewelink._tcp.local.", st["name"], timeout=2000)
+            cfg = self._match(info)
+            if cfg:
+                self._lan_state(info, cfg)
+            elif st["addr"]:
+                st["miss"] += 1
+                if st["miss"] >= LAN_MISS_LIMIT:
+                    self._undiscover(did, f"{LAN_MISS_LIMIT} poll misses")
+
+    def _lan_state(self, info, cfg):
+        props = _props(info)
+        try:
+            p = decrypt(props, cfg["key"]) if props.get("encrypt") in ("true", True) else {}
+        except Exception as e:
+            log("decrypt failed:", e); return
+        self.publish_state(cfg, p, online=True, source="LAN")
+
+    # -- the one publisher ----------------------------------------------------
+    def publish_state(self, cfg, p, online, source):
+        """Every route lands here: identical topics, identical shapes, so
+        downstream cannot tell (and need not care) which route delivered."""
+        if cfg["kind"] == "multi":
+            sws = p.get("switches")
+            if sws is None:
+                if online is False and cfg["id"] in self.last:
+                    out = {**self.last[cfg["id"]], "online": 0}   # offline stamp
+                else:
+                    return
+            else:
+                out = {"online": 1 if online else 0}
+                for sw in sws:
+                    if sw.get("outlet") is not None:
+                        out[f"ch{sw['outlet'] + 1}"] = 1 if sw.get("switch") == "on" else 0
+            self.last[cfg["id"]] = {k: v for k, v in out.items() if k != "online"}
+            self.client.publish(f"{cfg['prefix']}/json", json.dumps(out), qos=0, retain=True)
+            log(f"{source} state {cfg['prefix']}", out)
+            return
+        out = {}
+        if source != "LAN":               # power/V/A: cloud only (LAN values freeze)
+            for k in ("power", "voltage", "current"):
+                if k in p:
+                    try: out[k] = float(p[k])
+                    except Exception: pass
+        # the switch belongs to whichever route owns the device right now
+        if "switch" in p and (source == "LAN" or not self.lan_active(cfg["id"])):
+            out["switch"] = 1 if p["switch"] == "on" else 0
+        for k, v in out.items():
+            self.client.publish(f"{cfg['prefix']}/{k}", str(v), qos=0, retain=True)
+        if out:
+            self.client.publish(f"{cfg['prefix']}/json", json.dumps(out), qos=0, retain=True)
+            log(f"{source} state {cfg['prefix']}", out)
+
+    # -- control: discovery decides the route --------------------------------
+    def control(self, cfg, params):
+        """LAN when discovered — a LAN failure is a FAILURE, logged and surfaced,
+        never silently retried via cloud where it would mask problems. Cloud
+        when not discovered."""
+        if self.lan_active(cfg["id"]):
+            st = self.lan[cfg["id"]]
+            endpoint = "switches" if cfg["kind"] == "multi" else "switch"
+            iv_b64, data_b64 = encrypt(params, cfg["key"])
+            body = json.dumps({
+                "sequence": str(int(time.time() * 1000)), "deviceid": cfg["id"],
+                "selfApikey": "123", "iv": iv_b64, "encrypt": True, "data": data_b64,
+            }).encode()
+            try:
+                req = urllib.request.Request(
+                    f"http://{st['addr']}:{st['port']}/zeroconf/{endpoint}",
+                    data=body, headers={"Content-Type": "application/json"})
+                resp = json.loads(urllib.request.urlopen(req, timeout=5).read())
+                ok = resp.get("error") == 0
+                log(f"LAN control {cfg['prefix']} {params} -> {'ok' if ok else resp}")
+                self.lan_poll()                    # publish the confirmed state
+            except Exception as e:
+                log(f"LAN control {cfg['prefix']} FAILED:", e)
+            return
+        creds = self.auth.credentials()
+        if not creds:
+            log("cloud control impossible — no credentials"); return
+        at, appid, region = creds
+        try:
+            d = _cloud_req(f"{_api_base(region)}/v2/device/thing/status",
+                           body={"type": 1, "id": cfg["id"], "params": params},
+                           bearer=at, appid=appid)
+            ok = not d.get("error")
+            log(f"cloud control {cfg['prefix']} {params} -> "
+                f"{'ok' if ok else (d.get('error'), d.get('msg', ''))}")
+            if ok:
+                self.cloud_poll()                  # publish the confirmed state
+        except Exception as e:
+            log(f"cloud control {cfg['prefix']} FAILED:", e)
+
+    # -- cloud reconciliation poll --------------------------------------------
+    def cloud_poll(self, _retry=True):
+        creds = self.auth.credentials()
+        if not creds:
+            return
+        at, appid, region = creds
+        try:
+            d = _cloud_req(f"{_api_base(region)}/v2/device/thing", bearer=at, appid=appid)
+        except Exception as e:
+            log("cloud poll failed:", e); self._cloud_fail(); return
+        if d.get("error"):
+            if d["error"] in (401, 402) and _retry and self.auth.invalidate():
+                return self.cloud_poll(_retry=False)
+            log("cloud error", d.get("error"), d.get("msg", "")); self._cloud_fail(); return
+        seen = False
+        for t in (d.get("data") or {}).get("thingList") or []:
+            it = t.get("itemData", {})
+            cfg = DEVICES.get(it.get("deviceid"))
+            if not cfg:
+                continue
+            seen = True
+            if it.get("apikey"):
+                self.apikey = it["apikey"]        # the WS handshake wants this
+            if cfg["kind"] == "multi" and self.lan_active(cfg["id"]):
+                continue                          # LAN owns this device's state
+            # `online` lives on itemData, NOT params — hardcoding it true once
+            # kept an unplugged device "healthy" on the dashboard forever
+            self.publish_state(cfg, it.get("params") or {},
+                               online=bool(it.get("online")), source="poll")
+        if seen:
+            if self.cloud_fails >= CLOUD_MAX_FAILS:
+                log("cloud data back after outage")
+            self.cloud_fails = 0
+        else:
+            log("cloud poll: no known device in response"); self._cloud_fail()
+
+    def _cloud_fail(self):
+        """Clear retained cloud-only readings after repeated failures so
+        dashboards do not show frozen numbers as live. LAN state stays."""
+        self.cloud_fails += 1
+        if self.cloud_fails == CLOUD_MAX_FAILS:
+            log(f"cloud stale ({CLOUD_MAX_FAILS} fails) — clearing retained power/V/A")
+            for cfg in DEVICES.values():
+                if cfg["kind"] == "single":
+                    for k in ("power", "voltage", "current"):
+                        self.client.publish(f"{cfg['prefix']}/{k}", "", qos=0, retain=True)
+
+# ── cloud push (the WebSocket the vendor app uses) ───────────────────────────
+
+class CloudWS:
+    """Instant state for cloud-routed devices: dispatch/app hands out a WS host,
+    userOnline authenticates with the same OAuth token, and every change —
+    including app taps and the device's physical buttons — arrives as an
+    `update` the moment it happens. The REST poll is reconciliation only.
+    LAN-owned devices drop their pushes here exactly as the poll drops rows."""
+
+    def __init__(self, auth, bridge):
+        self.auth = auth
+        self.bridge = bridge
+
+    def start(self):
+        if websocket is None:
+            log("cloud push disabled (websocket-client not installed)"); return
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _connect(self):
+        creds = self.auth.credentials()
+        if not creds:
+            return None
+        at, appid, region = creds
+        d = _cloud_req(f"https://{region}-dispa.coolkit.{'cn' if region == 'cn' else 'cc'}/dispatch/app",
+                       body={"appid": appid, "nonce": secrets.token_hex(4),
+                             "ts": int(time.time()), "version": 8},
+                       bearer=at, appid=appid)
+        if not d.get("domain"):
+            return None
+        ws = websocket.create_connection(f"wss://{d['domain']}:{d['port']}/api/ws", timeout=15)
+        ws.send(json.dumps({
+            "action": "userOnline", "at": at, "apikey": self.bridge.apikey or "",
+            "appid": appid, "nonce": secrets.token_hex(4), "ts": int(time.time()),
+            "userAgent": "app", "sequence": str(int(time.time() * 1000)), "version": 8}))
+        hello = json.loads(ws.recv())
+        if hello.get("error") not in (0, None):
+            ws.close()
+            raise OSError(f"handshake refused: {hello.get('error')}")
+        hb = int((hello.get("config") or {}).get("hbInterval", 90))
+        log(f"cloud push connected (hb {hb}s)")
+        return ws, hb
+
+    def _run(self):
+        backoff = 5
+        while True:
+            ws = None
+            try:
+                got = self._connect()
+                if not got:
+                    time.sleep(60); continue
+                ws, hb = got
+                backoff = 5
+                ws.settimeout(20)                  # short, so pings stay on schedule
+                last_ping = time.time()
+                while True:
+                    if time.time() - last_ping >= hb:
+                        ws.send("ping"); last_ping = time.time()
+                    try:
+                        raw = ws.recv()
+                    except websocket.WebSocketTimeoutException:
+                        continue
+                    if not raw or raw == "pong":
+                        continue
+                    try:
+                        msg = json.loads(raw)
+                    except ValueError:
+                        continue
+                    self._handle(msg)
+            except Exception as e:
+                log("cloud push dropped:", e)
+                try:
+                    if ws: ws.close()
+                except Exception:
+                    pass
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 300)
+
+    def _handle(self, msg):
+        cfg = DEVICES.get(msg.get("deviceid"))
+        if not cfg or self.bridge.lan_active(cfg["id"]):
+            return
+        if msg.get("action") == "update":
+            self.bridge.publish_state(cfg, msg.get("params") or {}, online=True, source="push")
+        elif msg.get("action") == "sysmsg":
+            online = (msg.get("params") or {}).get("online")
+            if online is not None:
+                self.bridge.publish_state(cfg, {}, online=bool(online), source="push")
+
+# ── OAuth one-time login ─────────────────────────────────────────────────────
+
 def oauth_login():
-    """One-time interactive OAuth2.0 flow: print login URL, capture the redirect
-    code (30s validity!), exchange it, persist tokens to TOKEN_FILE."""
+    """Interactive: print login URL, capture the redirect code (30s validity!),
+    exchange it, persist tokens to TOKEN_FILE."""
     if not CLOUD_APPID or not CLOUD_APPSECRET:
         sys.exit("EWELINK_APPID and EWELINK_APPSECRET are required for auth")
     seq = str(int(time.time() * 1000))
@@ -189,14 +471,12 @@ def oauth_login():
         "authorization": base64.b64encode(hmac.new(
             CLOUD_APPSECRET.encode(), f"{CLOUD_APPID}_{seq}".encode(), hashlib.sha256).digest()).decode(),
         "redirectUrl": REDIRECT_URL, "grantType": "authorization_code",
-        "state": secrets.token_hex(8), "nonce": secrets.token_hex(4),
-    })
-    print("\nOpen this URL in a browser and log in with your eWeLink account:\n")
-    print(url + "\n")
+        "state": secrets.token_hex(8), "nonce": secrets.token_hex(4)})
+    print(f"\nOpen this URL in a browser and log in with your eWeLink account:\n\n{url}\n")
 
     code, region = None, CLOUD_REGION
     port = urllib.parse.urlparse(REDIRECT_URL).port or 80
-    try:                                # capture redirect on the local port if we can
+    try:
         from http.server import HTTPServer, BaseHTTPRequestHandler
         captured = {}
         class H(BaseHTTPRequestHandler):
@@ -224,349 +504,31 @@ def oauth_login():
         sys.exit("no authorization code received")
 
     d = _cloud_req(f"{_api_base(region)}/v2/user/oauth/token", body={
-        "code": code, "redirectUrl": REDIRECT_URL, "grantType": "authorization_code",
-    })
+        "code": code, "redirectUrl": REDIRECT_URL, "grantType": "authorization_code"})
     if d.get("error"):
         sys.exit(f"token exchange failed: {d.get('error')} {d.get('msg', '')}")
-    tok = {
-        "at": d["data"]["accessToken"], "rt": d["data"]["refreshToken"],
-        "atExpiredTime": d["data"].get("atExpiredTime", int(time.time() * 1000) + 30 * 86400 * 1000),
-        "rtExpiredTime": d["data"].get("rtExpiredTime", int(time.time() * 1000) + 60 * 86400 * 1000),
-        "region": region,
-    }
-    auth = CloudAuth(); auth.tok = tok; auth.save()
-    days = (tok["atExpiredTime"] - time.time() * 1000) / 86400000
+    now = int(time.time() * 1000)
+    auth = CloudAuth()
+    auth.tok = {"at": d["data"]["accessToken"], "rt": d["data"]["refreshToken"],
+                "atExpiredTime": d["data"].get("atExpiredTime", now + 30 * 86400 * 1000),
+                "rtExpiredTime": d["data"].get("rtExpiredTime", now + 60 * 86400 * 1000),
+                "region": region}
+    auth.save()
+    days = (auth.tok["atExpiredTime"] - now) / 86400000
     print(f"tokens saved to {TOKEN_FILE} (access token valid ~{days:.0f} days, auto-refreshed)")
 
-# ---------------------------------------------------------------- cloud push
-
-class CloudWS:
-    """eWeLink WebSocket subscription — the push channel the vendor app uses.
-
-    WHY (Dennis: "why 60s? why not instant? why not subscribe?"): the 60s REST
-    poll was inherited from power-polling politeness, not a limit. The cloud has
-    a real push API: dispatch/app hands out a WS host, userOnline authenticates
-    with the same OAuth access token, and every device state change arrives as
-    an `update` action the moment it happens — including changes made from the
-    eWeLink app or the physical buttons. The REST poll stays as reconciliation
-    (missed pushes, reconnect gaps), demoted to every CLOUD_INTERVAL as before.
-
-    LAN-owned devices stay LAN-owned: pushes for a discovered device are
-    dropped here exactly like the poll drops them.
-    """
-    def __init__(self, auth, listener):
-        self.auth = auth
-        self.listener = listener
-        self.ws = None
-        self.hb = 90
-
-    def start(self):
-        if websocket is None:
-            log("cloud push disabled (websocket-client not installed)"); return
-        threading.Thread(target=self._run, daemon=True).start()
-
-    def _dispatch(self):
-        creds = self.auth.credentials()
-        if not creds:
-            return None
-        at, appid, region = creds
-        d = _cloud_req(f"https://{region}-dispa.coolkit.{'cn' if region == 'cn' else 'cc'}/dispatch/app",
-                       body={"appid": appid, "nonce": secrets.token_hex(4),
-                             "ts": int(time.time()), "version": 8},
-                       bearer=at, appid=appid)
-        dom, port = d.get("domain"), d.get("port")
-        return f"wss://{dom}:{port}/api/ws" if dom else None
-
-    def _run(self):
-        backoff = 5
-        while True:
-            try:
-                url = self._dispatch()
-                if not url:
-                    time.sleep(60); continue
-                creds = self.auth.credentials()
-                at, appid, region = creds
-                self.ws = websocket.create_connection(url, timeout=15)
-                self.ws.send(json.dumps({
-                    "action": "userOnline", "at": at, "apikey": self.listener.apikey or "",
-                    "appid": appid, "nonce": secrets.token_hex(4),
-                    "ts": int(time.time()), "userAgent": "app",
-                    "sequence": str(int(time.time() * 1000)), "version": 8,
-                }))
-                hello = json.loads(self.ws.recv())
-                if hello.get("error") not in (0, None):
-                    log("cloud push handshake refused:", hello.get("error")); raise OSError
-                cfg = hello.get("config") or {}
-                if cfg.get("hb"):
-                    self.hb = int(cfg.get("hbInterval", 90))
-                log(f"cloud push connected (hb {self.hb}s)")
-                backoff = 5
-                self.ws.settimeout(self.hb + 10)
-                last_ping = time.time()
-                while True:
-                    if time.time() - last_ping >= self.hb:
-                        self.ws.send("ping"); last_ping = time.time()
-                    try:
-                        raw = self.ws.recv()
-                    except websocket.WebSocketTimeoutException:
-                        continue
-                    if not raw or raw == "pong":
-                        continue
-                    try:
-                        msg = json.loads(raw)
-                    except ValueError:
-                        continue
-                    self._handle(msg)
-            except Exception as e:
-                log("cloud push dropped:", e)
-                try:
-                    if self.ws: self.ws.close()
-                except Exception:
-                    pass
-                time.sleep(backoff)
-                backoff = min(backoff * 2, 300)
-
-    def _handle(self, msg):
-        did = msg.get("deviceid")
-        params = msg.get("params") or {}
-        if msg.get("action") not in ("update", "sysmsg") or not did:
-            return
-        cfg = DEVICES.get(did)
-        if not cfg:
-            return
-        if self.listener.lan_active(did):
-            return                                     # LAN owns this device
-        self.listener.publish_params(cfg, params, source="push")
-
-# ------------------------------------------------------------------ LAN path
-
-def decrypt(props, devkey=None):
-    """Decrypt eWeLink LAN mDNS TXT params. props: dict of str->str."""
-    key = hashlib.md5((devkey or DEVICE_KEY).encode()).digest()   # 16-byte AES key
-    iv = base64.b64decode(props["iv"])
-    data = "".join(props[k] for k in ("data1", "data2", "data3", "data4") if props.get(k))
-    ct = base64.b64decode(data)
-    pt = AES.new(key, AES.MODE_CBC, iv).decrypt(ct)
-    pt = pt[: -pt[-1]]                                        # strip PKCS7 padding
-    return json.loads(pt)
-
-def encrypt(params, devkey=None):
-    """AES-128-CBC encrypt a params dict with the device key (eWeLink LAN control)."""
-    key = hashlib.md5((devkey or DEVICE_KEY).encode()).digest()
-    iv = os.urandom(16)
-    data = json.dumps(params).encode()
-    pad = 16 - (len(data) % 16)
-    data += bytes([pad]) * pad
-    ct = AES.new(key, AES.MODE_CBC, iv).encrypt(data)
-    return base64.b64encode(iv).decode(), base64.b64encode(ct).decode()
-
-
-def _props(info):
-    out = {}
-    for k, v in (info.properties or {}).items():
-        try:
-            out[k.decode()] = v.decode() if isinstance(v, bytes) else v
-        except Exception:
-            pass
-    return out
-
-class Listener:
-    def __init__(self, client, zc, auth):
-        self.client = client
-        self.zc = zc
-        self.auth = auth
-        self.cloud_fails = 0      # consecutive failed cloud polls
-        # per-device LAN presence: deviceid -> {name, addr, port}
-        self.lan = {d: {"name": None, "addr": None, "port": None} for d in DEVICES}
-        self.apikey = None                    # account apikey, learned from the device list
-
-    # legacy accessors (the POWR3 was the only device once)
-    @property
-    def addr(self): return self.lan.get(DEVICE_ID, {}).get("addr")
-    @property
-    def name(self): return self.lan.get(DEVICE_ID, {}).get("name")
-
-    def _match(self, info):
-        # returns the registry entry this mDNS record belongs to, or None
-        if not info:
-            return None
-        did = _props(info).get("id")
-        cfg = DEVICES.get(did)
-        if not cfg:
-            return None
-        try:
-            addrs = info.parsed_addresses()
-            if addrs:
-                self.lan[did]["addr"] = addrs[0]
-                self.lan[did]["port"] = info.port
-        except Exception:
-            pass
-        return cfg
-
-    def _is_ours(self, info):
-        cfg = self._match(info)
-        return bool(cfg and cfg["id"] == DEVICE_ID)
-
-    # LAN control, any device: POST an AES-encrypted params dict to the device's
-    # zeroconf endpoint (switch for singles, switches for multis). No internet.
-    def lan_active(self, deviceid):
-        return bool((self.lan.get(deviceid) or {}).get("addr"))
-
-    def lan_control(self, cfg, params, endpoint):
-        st = self.lan.get(cfg["id"]) or {}
-        if not st.get("addr"):
-            return False                                   # not on our network
-        iv_b64, data_b64 = encrypt(params, cfg["key"])
-        body = json.dumps({
-            "sequence": str(int(time.time() * 1000)), "deviceid": cfg["id"],
-            "selfApikey": "123", "iv": iv_b64, "encrypt": True, "data": data_b64,
-        }).encode()
-        url = f"http://{st['addr']}:{st['port']}/zeroconf/{endpoint}"
-        try:
-            req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
-            resp = json.loads(urllib.request.urlopen(req, timeout=5).read())
-            log(f"LAN control {cfg['prefix']} {params} -> {resp}")
-            self.poll()                                   # publish the confirmed state back
-            return resp.get("error") == 0
-        except Exception as e:
-            log("LAN control failed:", e); return False
-
-    def control(self, on):
-        return self.lan_control(DEVICES[DEVICE_ID], {"switch": "on" if on else "off"}, "switch")
-
-    # eWeLink pushes are unreliable; we poll (re-query) instead. But still grab the
-    # instance name from discovery so poll() knows what to re-query.
-    def add_service(self, zc, type_, name):    self._maybe(zc, type_, name)
-    def update_service(self, zc, type_, name): self._maybe(zc, type_, name)
-    def remove_service(self, zc, type_, name): pass
-    def _maybe(self, zc, type_, name):
-        info = zc.get_service_info(type_, name, timeout=2000)
-        cfg = self._match(info)
-        if cfg:
-            self.lan[cfg["id"]]["name"] = name
-            log(f"LAN discovered {cfg['prefix']} at {self.lan[cfg['id']]['addr']}")
-            self._publish(info, cfg)
-
-    # Active poll: re-query the service (fresh mDNS query) and re-publish so SignalK
-    # stays live even when the device sends no unsolicited updates.
-    def poll(self):
-        for did, st in self.lan.items():
-            if not st.get("name"):
-                continue
-            info = self.zc.get_service_info("_ewelink._tcp.local.", st["name"], timeout=2000)
-            cfg = self._match(info)
-            if cfg:
-                self._publish(info, cfg)
-
-    def _publish(self, info, cfg=None):
-        # LAN mDNS carries the SWITCH state reliably; power/V/A over LAN are unreliable
-        # (frozen/thresholded) so we take those from the cloud instead.
-        cfg = cfg or DEVICES.get(DEVICE_ID)
-        props = _props(info)
-        try:
-            p = decrypt(props, cfg["key"]) if props.get("encrypt") in ("true", True) else {}
-        except Exception as e:
-            log("decrypt failed:", e); return
-        if cfg["kind"] == "single":
-            if "switch" in p:
-                self.client.publish(f"{cfg['prefix']}/switch",
-                                    str(1 if p["switch"] == "on" else 0), qos=0, retain=True)
-        else:
-            sws = p.get("switches")
-            if sws:
-                out = {"online": 1}
-                for sw in sws:
-                    o = sw.get("outlet")
-                    if o is not None:
-                        out[f"ch{o + 1}"] = 1 if sw.get("switch") == "on" else 0
-                self.client.publish(f"{cfg['prefix']}/json", json.dumps(out), qos=0, retain=True)
-
-    # No cloud data for CLOUD_MAX_FAILS polls in a row -> delete the retained
-    # power/voltage/current messages (empty retained payload clears them on the
-    # broker) so dashboards don't show frozen readings as live. Switch stays —
-    # the LAN path owns it.
-    def _cloud_fail(self):
-        self.cloud_fails += 1
-        if self.cloud_fails == CLOUD_MAX_FAILS:
-            log(f"cloud data stale ({CLOUD_MAX_FAILS} failed polls) — clearing retained power/voltage/current")
-            for k in ("power", "voltage", "current"):
-                self.client.publish(f"{PREFIX}/{k}", "", qos=0, retain=True)
-
-    # One publisher for cloud data, fed by the 60s reconciliation poll AND the
-    # WebSocket push — identical topics, identical shapes, so downstream cannot
-    # tell (and need not care) which one delivered.
-    def publish_params(self, cfg, p, source="poll"):
-        if cfg["kind"] == "multi":
-            sws = p.get("switches")
-            if sws is None:
-                if "online" in p:
-                    # sysmsg online/offline only — merge is overkill; next poll trues it up
-                    return
-                return
-            out = {"online": 1}
-            for sw in sws:
-                o = sw.get("outlet")
-                if o is not None:
-                    out[f"ch{o + 1}"] = 1 if sw.get("switch") == "on" else 0
-            self.client.publish(f"{cfg['prefix']}/json", json.dumps(out), qos=0, retain=True)
-            log(f"cloud {source} published ewe4", out)
-            return
-        out = {}
-        for k in ("power", "voltage", "current"):
-            if k in p:
-                try: out[k] = float(p[k])
-                except Exception: pass
-        if "switch" in p and not self.lan_active(cfg["id"]):
-            out["switch"] = 1 if p["switch"] == "on" else 0
-        for k, v in out.items():
-            self.client.publish(f"{cfg['prefix']}/{k}", str(v), qos=0, retain=True)
-        if out:
-            self.client.publish(f"{cfg['prefix']}/json", json.dumps(out), qos=0, retain=True)
-            log(f"cloud {source} published", out)
-
-    # Cloud read of power/voltage/current (the reliable source for those).
-    def cloud_poll(self, _retry=True):
-        creds = self.auth.credentials()
-        if not creds:
-            return
-        at, appid, region = creds
-        try:
-            d = _cloud_req(f"{_api_base(region)}/v2/device/thing", bearer=at, appid=appid)
-        except Exception as e:
-            log("cloud poll failed:", e); self._cloud_fail(); return
-        if d.get("error"):
-            if d["error"] in (401, 402) and _retry and self.auth.invalidate():
-                return self.cloud_poll(_retry=False)
-            log("cloud error", d.get("error"), d.get("msg", "")); self._cloud_fail(); return
-        published = False
-        for t in (d.get("data") or {}).get("thingList") or []:
-            it = t.get("itemData", {})
-            cfg = DEVICES.get(it.get("deviceid"))
-            if not cfg:
-                continue
-            # the WS handshake wants the account apikey; the device list carries it
-            if it.get("apikey"):
-                self.apikey = it["apikey"]
-            if cfg["kind"] == "multi" and self.lan_active(cfg["id"]):
-                continue                       # LAN owns this device's state
-            self.publish_params(cfg, it.get("params", {}) or {})
-            published = True
-        if published:
-            if self.cloud_fails >= CLOUD_MAX_FAILS:
-                log("cloud data back after outage")
-            self.cloud_fails = 0
-        else:
-            log("cloud poll: our device not in response"); self._cloud_fail()
+# ── main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    if not DEVICE_ID or not DEVICE_KEY:
-        sys.exit("DEVICE_ID and DEVICE_KEY are required")
+    if not DEVICES:
+        sys.exit("no devices configured (DEVICE_ID / EWE4_ID)")
     auth = CloudAuth()
     try:
         client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1)
     except Exception:
         client = mqtt.Client()
-    client.will_set(f"{PREFIX}/online", "0", retain=True)
+    lwt = next(iter(DEVICES.values()))["prefix"]   # bridge liveness rides device 0
+    client.will_set(f"{lwt}/online", "0", retain=True)
     while True:
         try:
             client.connect(MQTT_HOST, MQTT_PORT, 60)
@@ -574,96 +536,55 @@ def main():
         except Exception as e:
             log("mqtt connect retry:", e); time.sleep(5)
     client.loop_start()
-    client.publish(f"{PREFIX}/online", "1", retain=True)
-    log(f"listening for POWR3 {DEVICE_ID} over LAN -> {PREFIX}/* on {MQTT_HOST}:{MQTT_PORT}")
+    client.publish(f"{lwt}/online", "1", retain=True)
 
     zc = Zeroconf()
-    listener = Listener(client, zc, auth)
-    ServiceBrowser(zc, "_ewelink._tcp.local.", listener)
+    bridge = Bridge(client, zc, auth)
+    ServiceBrowser(zc, "_ewelink._tcp.local.", bridge)
 
-    # control:
-    #   <prefix>/cmd/switch        = on/off -> LAN control of the POWR3 relay
-    #   <ewe4 prefix>/cmd/ch[1-4]  = on/off -> CLOUD control of the 4CH (it is on
-    #                                another network; the cloud is the only path)
-    def _cloud_switch(deviceid, params):
-        creds = auth.credentials()
-        if not creds:
-            log("cloud control impossible — no credentials"); return False
-        at, appid, region = creds
-        try:
-            d = _cloud_req(f"{_api_base(region)}/v2/device/thing/status",
-                body={"type": 1, "id": deviceid, "params": params},
-                bearer=at, appid=appid)
-            if d.get("error"):
-                log("cloud control error", d.get("error"), d.get("msg", "")); return False
-            listener.cloud_poll()
-            return True
-        except Exception as e:
-            log("cloud control failed:", e); return False
-
-    def _ewe4_control(ch, on):
-        # ROUTE BY DISCOVERY, not per-operation fallback (Dennis): if mDNS has
-        # the device on OUR network, LAN owns it — a LAN failure is a FAILURE,
-        # logged, not silently retried via cloud where it would mask problems.
-        # Undiscovered = cloud is the route.
-        cfg = DEVICES.get(EWE4_ID)
-        params = {"switches": [{"switch": "on" if on else "off", "outlet": ch - 1}]}
-        if listener.lan_active(EWE4_ID):
-            ok = listener.lan_control(cfg, params, "switches")
-            log(f"ewe4 ch{ch} -> {'on' if on else 'off'} (LAN {'ok' if ok else 'FAILED'})")
-            return
-        ok = _cloud_switch(EWE4_ID, params)
-        log(f"ewe4 ch{ch} -> {'on' if on else 'off'} (cloud {'ok' if ok else 'FAILED'})")
-
+    # command topics: <prefix>/cmd/switch (single), <prefix>/cmd/ch<N> (multi)
     def on_message(cl, ud, msg):
         cmd = msg.payload.decode(errors="ignore").strip().lower()
-        if EWE4_ID and msg.topic.startswith(f"{EWE4_PREFIX}/cmd/ch"):
-            try:
-                ch = int(msg.topic.rsplit("ch", 1)[1])
-            except ValueError:
-                return
-            if 1 <= ch <= 4:
-                log(f"ewe4 cmd ch{ch} = {cmd}")
-                _ewe4_control(ch, cmd in ("on", "1", "true"))
-            return
-        log(f"cmd/switch = {cmd}")
         on = cmd in ("on", "1", "true")
-        # route by discovery: LAN when the POWR3 is on our network (its normal
-        # life), cloud only when it has never been discovered
-        if listener.lan_active(DEVICE_ID):
-            listener.control(on)
-        else:
-            _cloud_switch(DEVICE_ID, {"switch": "on" if on else "off"})
+        for cfg in DEVICES.values():
+            if cfg["kind"] == "single" and msg.topic == f"{cfg['prefix']}/cmd/switch":
+                log(f"cmd {cfg['prefix']} switch = {cmd}")
+                bridge.control(cfg, {"switch": "on" if on else "off"})
+                return
+            if cfg["kind"] == "multi" and msg.topic.startswith(f"{cfg['prefix']}/cmd/ch"):
+                try:
+                    ch = int(msg.topic.rsplit("ch", 1)[1])
+                except ValueError:
+                    return
+                if 1 <= ch <= cfg.get("channels", 4):
+                    log(f"cmd {cfg['prefix']} ch{ch} = {cmd}")
+                    bridge.control(cfg, {"switches": [
+                        {"switch": "on" if on else "off", "outlet": ch - 1}]})
+                return
     client.on_message = on_message
-    client.subscribe(f"{PREFIX}/cmd/switch")
-    if EWE4_ID:
-        client.subscribe(f"{EWE4_PREFIX}/cmd/+")
-        log(f"ewe4 {EWE4_ID} bridged: {EWE4_PREFIX}/json + cmd/ch1..4 (cloud)")
+    for cfg in DEVICES.values():
+        client.subscribe(f"{cfg['prefix']}/cmd/+")
+        log(f"{cfg['prefix']}: {cfg['kind']} device {cfg['id']} — LAN when discovered, else cloud")
 
-    cloud = auth.credentials() is not None
-    if cloud:
-        src = "OAuth" if auth.tok else "manual token"
-        log(f"cloud reconciliation poll enabled ({src}, region {auth.region}, every {CLOUD_INTERVAL}s)")
-        listener.cloud_poll()
-        # the PUSH channel: instant state for every cloud-routed device; the poll
-        # above remains as reconciliation only
-        CloudWS(auth, listener).start()
+    if auth.credentials():
+        log(f"cloud: reconciliation poll every {CLOUD_INTERVAL}s + push channel "
+            f"({'OAuth' if auth.tok else 'manual token'}, region {auth.region})")
+        bridge.cloud_poll()                        # also learns the account apikey
+        CloudWS(auth, bridge).start()
     else:
-        log("no cloud credentials — power/voltage/current not published (LAN switch+control still work)")
+        log("no cloud credentials — LAN-discovered devices only")
+
     n = 0
     try:
         while True:
-            time.sleep(15)          # LAN switch state cadence
-            listener.poll()
+            time.sleep(LAN_POLL_S)
+            bridge.lan_poll()
             n += 1
-            if cloud and (n * 15) % CLOUD_INTERVAL < 15:   # ~every CLOUD_INTERVAL
-                listener.cloud_poll()
-            client.publish(f"{PREFIX}/online", "1", retain=True)
+            if (n * LAN_POLL_S) % CLOUD_INTERVAL < LAN_POLL_S:
+                bridge.cloud_poll()
+            client.publish(f"{lwt}/online", "1", retain=True)
     finally:
         zc.close()
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "auth":
-        oauth_login()
-    else:
-        main()
+    oauth_login() if (len(sys.argv) > 1 and sys.argv[1] == "auth") else main()
