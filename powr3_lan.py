@@ -18,7 +18,7 @@ access token in EWELINK_TOKEN (bound to EWELINK_TOKEN_APPID) is used if OAuth to
 are absent or refresh fails.
 
 Env:
-  DEVICE_ID            eWeLink deviceid (e.g. 10013c5fde)
+  DEVICE_ID            eWeLink deviceid (e.g. 100155ab01)
   DEVICE_KEY           eWeLink devicekey (SECRET) — from the cloud API once
   EWELINK_APPID        OAuth2.0 app id from dev.ewelink.cc
   EWELINK_APPSECRET    OAuth2.0 app secret (SECRET)

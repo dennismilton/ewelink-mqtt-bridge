@@ -1,9 +1,26 @@
 # maracaibo-sonoff
 
-Bridge between a Sonoff **POWR3** shore-power energy meter and MQTT, for the vessel
-**Maracaibo**'s SignalK dashboard. Publishes shore-power readings to MQTT, where
-`signalk-mqtt-sensors` maps them into SignalK (`electrical.ac.shore.*`) and the
-dashboard reads SignalK only.
+Bridge between **eWeLink/Sonoff devices** and MQTT — LAN-first, cloud-fallback —
+built for the vessel *Maracaibo*'s SignalK dashboard and generic enough for any
+MQTT consumer (SignalK via `signalk-mqtt-sensors`, Home Assistant, Node-RED…).
+
+Devices carried today: a **POWR3** shore-power energy meter (relay + power/V/A)
+and an optional **4-channel switch** (uiid 4). Adding another eWeLink device is
+an env entry, not a fork.
+
+## Routing — discovery decides
+
+Every device follows one contract: **if mDNS has discovered the device on this
+bridge's network, LAN owns it** — state comes off the encrypted mDNS records and
+control is an AES-encrypted POST straight to the device, no internet in the
+path. A device the bridge has *not* discovered (different network, mDNS outage)
+routes to the eWeLink cloud API for both. There is no per-operation fallback: a
+LAN failure on a discovered device is a logged failure, so problems surface
+instead of hiding behind the cloud. The cloud poll yields any state LAN owns,
+so two sources never fight over one retained topic.
+
+Move a device onto the bridge's network and it becomes offline-capable the
+moment mDNS sees it — no configuration change.
 
 ## Architecture — hybrid LAN + cloud
 
@@ -67,7 +84,12 @@ Subscribed (in):
 
 | MQTT topic | payload | action |
 |---|---|---|
-| `maracaibo/sonoff/powr3/cmd/switch` | `on` / `off` (also `1`/`true`) | LAN-control the POWR3 relay |
+| `maracaibo/sonoff/powr3/cmd/switch` | `on` / `off` (also `1`/`true`) | control the POWR3 relay (LAN when discovered, else cloud) |
+| `maracaibo/sonoff/ewe4/cmd/ch1..4` | `on` / `off` | control a 4CH channel (LAN when discovered, else cloud) |
+
+4CH state publishes as one retained JSON topic `<EWE4_PREFIX>/json` —
+`{"online":1,"ch1":0,...}` — numeric values so downstream consumers can chart
+them (string payloads cannot be averaged; learned the hard way).
 
 All published topics are retained. `online` is `1` while running and `0` via the MQTT
 last-will. The topic prefix is configurable (`TOPIC_PREFIX`).
@@ -128,3 +150,18 @@ So `cloud_poll` also publishes `maracaibo/sonoff/powr3/json`
 SignalK maps `electrical.ac.shore.*` from **that** topic with `json_path`. The
 per-key topics are unchanged and still published, so anything else reading them
 keeps working — this adds a typed path, it does not replace the old one.
+
+## Second device: the 4CH
+
+| var | required | default | meaning |
+|---|---|---|---|
+| `EWE4_ID` | no | — | eWeLink deviceid of a 4-channel switch (uiid 4) |
+| `EWE4_KEY` | no | — | its devicekey — **secret**, needed for LAN control |
+| `EWE4_PREFIX` | no | `maracaibo/sonoff/ewe4` | MQTT topic prefix |
+
+The devicekey comes from the cloud device list once (`/v2/device/thing`) and is
+then a permanent local credential — LAN control works with the WAN down.
+
+## License
+
+MIT.
