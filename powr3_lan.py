@@ -36,6 +36,11 @@ import os, sys, json, time, hashlib, hmac, base64, secrets, urllib.request, urll
 from Crypto.Cipher import AES
 from zeroconf import Zeroconf, ServiceBrowser
 import paho.mqtt.client as mqtt
+import threading
+try:
+    import websocket                      # cloud push (websocket-client)
+except ImportError:                       # bridge still works poll-only without it
+    websocket = None
 
 DEVICE_ID = os.environ.get("DEVICE_ID", "").strip()
 DEVICE_KEY = os.environ.get("DEVICE_KEY", "").strip()
@@ -233,6 +238,106 @@ def oauth_login():
     days = (tok["atExpiredTime"] - time.time() * 1000) / 86400000
     print(f"tokens saved to {TOKEN_FILE} (access token valid ~{days:.0f} days, auto-refreshed)")
 
+# ---------------------------------------------------------------- cloud push
+
+class CloudWS:
+    """eWeLink WebSocket subscription — the push channel the vendor app uses.
+
+    WHY (Dennis: "why 60s? why not instant? why not subscribe?"): the 60s REST
+    poll was inherited from power-polling politeness, not a limit. The cloud has
+    a real push API: dispatch/app hands out a WS host, userOnline authenticates
+    with the same OAuth access token, and every device state change arrives as
+    an `update` action the moment it happens — including changes made from the
+    eWeLink app or the physical buttons. The REST poll stays as reconciliation
+    (missed pushes, reconnect gaps), demoted to every CLOUD_INTERVAL as before.
+
+    LAN-owned devices stay LAN-owned: pushes for a discovered device are
+    dropped here exactly like the poll drops them.
+    """
+    def __init__(self, auth, listener):
+        self.auth = auth
+        self.listener = listener
+        self.ws = None
+        self.hb = 90
+
+    def start(self):
+        if websocket is None:
+            log("cloud push disabled (websocket-client not installed)"); return
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _dispatch(self):
+        creds = self.auth.credentials()
+        if not creds:
+            return None
+        at, appid, region = creds
+        d = _cloud_req(f"https://{region}-dispa.coolkit.{'cn' if region == 'cn' else 'cc'}/dispatch/app",
+                       body={"appid": appid, "nonce": secrets.token_hex(4),
+                             "ts": int(time.time()), "version": 8},
+                       bearer=at, appid=appid)
+        dom, port = d.get("domain"), d.get("port")
+        return f"wss://{dom}:{port}/api/ws" if dom else None
+
+    def _run(self):
+        backoff = 5
+        while True:
+            try:
+                url = self._dispatch()
+                if not url:
+                    time.sleep(60); continue
+                creds = self.auth.credentials()
+                at, appid, region = creds
+                self.ws = websocket.create_connection(url, timeout=15)
+                self.ws.send(json.dumps({
+                    "action": "userOnline", "at": at, "apikey": self.listener.apikey or "",
+                    "appid": appid, "nonce": secrets.token_hex(4),
+                    "ts": int(time.time()), "userAgent": "app",
+                    "sequence": str(int(time.time() * 1000)), "version": 8,
+                }))
+                hello = json.loads(self.ws.recv())
+                if hello.get("error") not in (0, None):
+                    log("cloud push handshake refused:", hello.get("error")); raise OSError
+                cfg = hello.get("config") or {}
+                if cfg.get("hb"):
+                    self.hb = int(cfg.get("hbInterval", 90))
+                log(f"cloud push connected (hb {self.hb}s)")
+                backoff = 5
+                self.ws.settimeout(self.hb + 10)
+                last_ping = time.time()
+                while True:
+                    if time.time() - last_ping >= self.hb:
+                        self.ws.send("ping"); last_ping = time.time()
+                    try:
+                        raw = self.ws.recv()
+                    except websocket.WebSocketTimeoutException:
+                        continue
+                    if not raw or raw == "pong":
+                        continue
+                    try:
+                        msg = json.loads(raw)
+                    except ValueError:
+                        continue
+                    self._handle(msg)
+            except Exception as e:
+                log("cloud push dropped:", e)
+                try:
+                    if self.ws: self.ws.close()
+                except Exception:
+                    pass
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 300)
+
+    def _handle(self, msg):
+        did = msg.get("deviceid")
+        params = msg.get("params") or {}
+        if msg.get("action") not in ("update", "sysmsg") or not did:
+            return
+        cfg = DEVICES.get(did)
+        if not cfg:
+            return
+        if self.listener.lan_active(did):
+            return                                     # LAN owns this device
+        self.listener.publish_params(cfg, params, source="push")
+
 # ------------------------------------------------------------------ LAN path
 
 def decrypt(props, devkey=None):
@@ -273,6 +378,7 @@ class Listener:
         self.cloud_fails = 0      # consecutive failed cloud polls
         # per-device LAN presence: deviceid -> {name, addr, port}
         self.lan = {d: {"name": None, "addr": None, "port": None} for d in DEVICES}
+        self.apikey = None                    # account apikey, learned from the device list
 
     # legacy accessors (the POWR3 was the only device once)
     @property
@@ -386,6 +492,38 @@ class Listener:
             for k in ("power", "voltage", "current"):
                 self.client.publish(f"{PREFIX}/{k}", "", qos=0, retain=True)
 
+    # One publisher for cloud data, fed by the 60s reconciliation poll AND the
+    # WebSocket push — identical topics, identical shapes, so downstream cannot
+    # tell (and need not care) which one delivered.
+    def publish_params(self, cfg, p, source="poll"):
+        if cfg["kind"] == "multi":
+            sws = p.get("switches")
+            if sws is None:
+                if "online" in p:
+                    # sysmsg online/offline only — merge is overkill; next poll trues it up
+                    return
+                return
+            out = {"online": 1}
+            for sw in sws:
+                o = sw.get("outlet")
+                if o is not None:
+                    out[f"ch{o + 1}"] = 1 if sw.get("switch") == "on" else 0
+            self.client.publish(f"{cfg['prefix']}/json", json.dumps(out), qos=0, retain=True)
+            log(f"cloud {source} published ewe4", out)
+            return
+        out = {}
+        for k in ("power", "voltage", "current"):
+            if k in p:
+                try: out[k] = float(p[k])
+                except Exception: pass
+        if "switch" in p and not self.lan_active(cfg["id"]):
+            out["switch"] = 1 if p["switch"] == "on" else 0
+        for k, v in out.items():
+            self.client.publish(f"{cfg['prefix']}/{k}", str(v), qos=0, retain=True)
+        if out:
+            self.client.publish(f"{cfg['prefix']}/json", json.dumps(out), qos=0, retain=True)
+            log(f"cloud {source} published", out)
+
     # Cloud read of power/voltage/current (the reliable source for those).
     def cloud_poll(self, _retry=True):
         creds = self.auth.credentials()
@@ -397,57 +535,22 @@ class Listener:
         except Exception as e:
             log("cloud poll failed:", e); self._cloud_fail(); return
         if d.get("error"):
-            # 401/402 = invalid/expired token -> refresh once and retry
             if d["error"] in (401, 402) and _retry and self.auth.invalidate():
                 return self.cloud_poll(_retry=False)
             log("cloud error", d.get("error"), d.get("msg", "")); self._cloud_fail(); return
         published = False
         for t in (d.get("data") or {}).get("thingList") or []:
             it = t.get("itemData", {})
-            if EWE4_ID and it.get("deviceid") == EWE4_ID:
-                if self.lan_active(EWE4_ID):
-                    continue                       # LAN owns this device's state
-                # one JSON payload, numeric values — per-key string topics are how
-                # shore power became unaverageable strings in Influx (see below)
-                pr = it.get("params", {}) or {}
-                out4 = {"online": 1 if it.get("online") else 0}
-                for sw in pr.get("switches") or []:
-                    o = sw.get("outlet")
-                    if o is not None:
-                        out4[f"ch{o + 1}"] = 1 if sw.get("switch") == "on" else 0
-                self.client.publish(f"{EWE4_PREFIX}/json", json.dumps(out4), qos=0, retain=True)
-                published = True
-                log("cloud published ewe4", out4)
+            cfg = DEVICES.get(it.get("deviceid"))
+            if not cfg:
                 continue
-            if it.get("deviceid") != DEVICE_ID:
-                continue
-            p = it.get("params", {})
-            out = {}
-            for k in ("power", "voltage", "current"):
-                if k in p:
-                    try: out[k] = float(p[k])
-                    except Exception: pass
-            if "switch" in p and not self.lan_active(DEVICE_ID):
-                out["switch"] = 1 if p["switch"] == "on" else 0
-            for k, v in out.items():
-                self.client.publish(f"{PREFIX}/{k}", str(v), qos=0, retain=True)
-            # ALSO publish the whole reading as JSON, and this is about TYPES, not
-            # convenience. The per-key topics carry a bare string ("134.97"), and
-            # signalk-mqtt-sensors has no numeric conversion for sensor type
-            # "other" — it passes the payload straight through — so shore power,
-            # voltage and current landed in SignalK as STRINGS. They logged to
-            # InfluxDB fine and then could not be read back: the History API
-            # answered `unsupported mean iterator type: *query.stringInterruptIterator`,
-            # because you cannot average a string. The tank topics never had this
-            # problem precisely because they arrive as JSON, where the extracted
-            # value is already a number. Mapping shore from this topic with a
-            # json_path gives the plugin a real float. The per-key topics stay
-            # exactly as they were, so nothing else that reads them breaks.
-            if out:
-                self.client.publish(f"{PREFIX}/json", json.dumps(out), qos=0, retain=True)
-            if out:
-                published = True
-                log("cloud published", out)
+            # the WS handshake wants the account apikey; the device list carries it
+            if it.get("apikey"):
+                self.apikey = it["apikey"]
+            if cfg["kind"] == "multi" and self.lan_active(cfg["id"]):
+                continue                       # LAN owns this device's state
+            self.publish_params(cfg, it.get("params", {}) or {})
+            published = True
         if published:
             if self.cloud_fails >= CLOUD_MAX_FAILS:
                 log("cloud data back after outage")
@@ -540,8 +643,11 @@ def main():
     cloud = auth.credentials() is not None
     if cloud:
         src = "OAuth" if auth.tok else "manual token"
-        log(f"cloud power poll enabled ({src}, region {auth.region}, every {CLOUD_INTERVAL}s)")
+        log(f"cloud reconciliation poll enabled ({src}, region {auth.region}, every {CLOUD_INTERVAL}s)")
         listener.cloud_poll()
+        # the PUSH channel: instant state for every cloud-routed device; the poll
+        # above remains as reconciliation only
+        CloudWS(auth, listener).start()
     else:
         log("no cloud credentials — power/voltage/current not published (LAN switch+control still work)")
     n = 0

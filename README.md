@@ -22,6 +22,20 @@ so two sources never fight over one retained topic.
 Move a device onto the bridge's network and it becomes offline-capable the
 moment mDNS sees it — no configuration change.
 
+## State is pushed, not polled
+
+Two push channels, one per route:
+
+- **LAN**: mDNS service updates — the device announces changes on the local
+  network and the listener republishes them.
+- **Cloud**: the eWeLink **WebSocket** (`dispatch/app` → `userOnline` with the
+  same OAuth token) — every state change arrives the moment it happens,
+  including changes made from the eWeLink app or the device's physical buttons.
+
+The 60s REST poll remains as **reconciliation only** (reconnect gaps, missed
+pushes) and as the source for POWR3 power/V/A. Both feeds publish through one
+code path to identical topics, so consumers never know which delivered.
+
 ## Architecture — hybrid LAN + cloud
 
 The bridge uses **two paths** because the POWR3 firmware splits its data unevenly
