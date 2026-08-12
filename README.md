@@ -50,12 +50,14 @@ between the local and cloud APIs:
     `/zeroconf/switch` endpoint (device IP + port discovered via mDNS). Works with
     no internet.
 
-- **Cloud path (poll, ~60s)** — eWeLink/CoolKit v2 cloud API. Used for
-  **power / voltage / current** only.
-  **Why:** the POWR3 does **not** reliably report live power/voltage/current over the
-  eWeLink LAN protocol — Sonoff's firmware only pushes those over LAN on large
-  threshold changes, so LAN readings go stale/frozen. The cloud poll is the reliable
-  source for those three values.
+- **Cloud path** — eWeLink/CoolKit v2 cloud API. Used for
+  **power / voltage / current**.
+  **Why (measured 2026-08-12):** the LAN record actually carries the same
+  power/V/A values as the cloud, byte-identical — but the POWR3 reports them
+  lazily on ITS OWN cadence to both paths (a real 17 W load step moved neither
+  for 2.5 min). Cloud sourcing is kept for one code path over identical data.
+  Genuinely live power would require the eWeLink app's `uiActive` nudge, which
+  asks the device to stream for 120 s at a time — a possible future feature.
 
 If no cloud credentials are configured, power/voltage/current are simply not
 published; switch state and relay control still work fully offline over LAN.

@@ -44,7 +44,14 @@ LAN_MISS_LIMIT = 4                        # poll misses before we UNDISCOVER
 
 # ── the device registry ──────────────────────────────────────────────────────
 # kind 'single': one relay, {switch:on/off}, state topics <prefix>/<key>,
-#                power/V/A from cloud only (LAN readings freeze — firmware).
+#                power/V/A from cloud only. MEASURED 2026-08-12: the LAN mDNS
+#                record carries power/V/A too, byte-identical to the cloud —
+#                and a real 17W load step moved NEITHER for 2.5 min. The DEVICE
+#                reports power lazily on its own cadence to both paths; the old
+#                "LAN freezes, cloud is reliable" rationale blamed the wrong
+#                layer. Cloud sourcing stays (identical data, one code path);
+#                genuinely LIVE power would need the app's uiActive nudge, which
+#                asks the device to stream for 120s at a time.
 # kind 'multi':  N relays, {switches:[{switch,outlet}]}, ONE numeric-JSON state
 #                topic <prefix>/json (strings cannot be averaged downstream).
 DEVICES = {}
