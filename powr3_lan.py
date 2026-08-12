@@ -63,7 +63,22 @@ CLOUD_MAX_FAILS = int(os.environ.get("CLOUD_MAX_FAILS", "10"))
 # Same account, same tokens, same /v2/device/thing poll we already make; the 4CH
 # rows just fall out of the response we were throwing away.
 EWE4_ID = os.environ.get("EWE4_ID", "").strip()
+EWE4_KEY = os.environ.get("EWE4_KEY", "").strip()
 EWE4_PREFIX = os.environ.get("EWE4_PREFIX", "maracaibo/sonoff/ewe4").rstrip("/")
+
+# THE DEVICE REGISTRY — every eWeLink device this bridge owns, each with the
+# same contract (Dennis: "support both on all ewe devices — LAN first, then
+# cloud"): if mDNS has discovered the device on OUR network, state and control
+# go direct (no internet); otherwise both fall back to the cloud. A device that
+# moves onto the boat WiFi goes offline-capable automatically the moment mDNS
+# sees it — no config change.
+DEVICES = {}
+if DEVICE_ID:
+    DEVICES[DEVICE_ID] = {"id": DEVICE_ID, "key": DEVICE_KEY, "prefix": PREFIX,
+                          "kind": "single"}
+if EWE4_ID:
+    DEVICES[EWE4_ID] = {"id": EWE4_ID, "key": EWE4_KEY, "prefix": EWE4_PREFIX,
+                        "kind": "multi", "channels": 4}
 
 log = lambda *a: print(*a, flush=True)
 
@@ -220,9 +235,9 @@ def oauth_login():
 
 # ------------------------------------------------------------------ LAN path
 
-def decrypt(props):
+def decrypt(props, devkey=None):
     """Decrypt eWeLink LAN mDNS TXT params. props: dict of str->str."""
-    key = hashlib.md5(DEVICE_KEY.encode()).digest()          # 16-byte AES key
+    key = hashlib.md5((devkey or DEVICE_KEY).encode()).digest()   # 16-byte AES key
     iv = base64.b64decode(props["iv"])
     data = "".join(props[k] for k in ("data1", "data2", "data3", "data4") if props.get(k))
     ct = base64.b64decode(data)
@@ -230,9 +245,9 @@ def decrypt(props):
     pt = pt[: -pt[-1]]                                        # strip PKCS7 padding
     return json.loads(pt)
 
-def encrypt(params):
+def encrypt(params, devkey=None):
     """AES-128-CBC encrypt a params dict with the device key (eWeLink LAN control)."""
-    key = hashlib.md5(DEVICE_KEY.encode()).digest()
+    key = hashlib.md5((devkey or DEVICE_KEY).encode()).digest()
     iv = os.urandom(16)
     data = json.dumps(params).encode()
     pad = 16 - (len(data) % 16)
@@ -256,38 +271,62 @@ class Listener:
         self.zc = zc
         self.auth = auth
         self.cloud_fails = 0      # consecutive failed cloud polls
-        self.name = None          # our device's mDNS instance name, once discovered
-        self.addr = None          # device IP + port (for LAN control)
-        self.port = None
+        # per-device LAN presence: deviceid -> {name, addr, port}
+        self.lan = {d: {"name": None, "addr": None, "port": None} for d in DEVICES}
 
-    def _is_ours(self, info):
-        if not info or _props(info).get("id") != DEVICE_ID:
-            return False
+    # legacy accessors (the POWR3 was the only device once)
+    @property
+    def addr(self): return self.lan.get(DEVICE_ID, {}).get("addr")
+    @property
+    def name(self): return self.lan.get(DEVICE_ID, {}).get("name")
+
+    def _match(self, info):
+        # returns the registry entry this mDNS record belongs to, or None
+        if not info:
+            return None
+        did = _props(info).get("id")
+        cfg = DEVICES.get(did)
+        if not cfg:
+            return None
         try:
             addrs = info.parsed_addresses()
-            if addrs: self.addr = addrs[0]; self.port = info.port
+            if addrs:
+                self.lan[did]["addr"] = addrs[0]
+                self.lan[did]["port"] = info.port
         except Exception:
             pass
-        return True
+        return cfg
 
-    # LAN control: POST an AES-encrypted {switch:on/off} to the device (offline).
-    def control(self, on):
-        if not self.addr:
-            log("control: device address not yet discovered"); return False
-        iv_b64, data_b64 = encrypt({"switch": "on" if on else "off"})
+    def _is_ours(self, info):
+        cfg = self._match(info)
+        return bool(cfg and cfg["id"] == DEVICE_ID)
+
+    # LAN control, any device: POST an AES-encrypted params dict to the device's
+    # zeroconf endpoint (switch for singles, switches for multis). No internet.
+    def lan_active(self, deviceid):
+        return bool((self.lan.get(deviceid) or {}).get("addr"))
+
+    def lan_control(self, cfg, params, endpoint):
+        st = self.lan.get(cfg["id"]) or {}
+        if not st.get("addr"):
+            return False                                   # not on our network
+        iv_b64, data_b64 = encrypt(params, cfg["key"])
         body = json.dumps({
-            "sequence": str(int(time.time() * 1000)), "deviceid": DEVICE_ID,
+            "sequence": str(int(time.time() * 1000)), "deviceid": cfg["id"],
             "selfApikey": "123", "iv": iv_b64, "encrypt": True, "data": data_b64,
         }).encode()
-        url = f"http://{self.addr}:{self.port}/zeroconf/switch"
+        url = f"http://{st['addr']}:{st['port']}/zeroconf/{endpoint}"
         try:
             req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
             resp = json.loads(urllib.request.urlopen(req, timeout=5).read())
-            log(f"control switch={'on' if on else 'off'} -> {resp}")
+            log(f"LAN control {cfg['prefix']} {params} -> {resp}")
             self.poll()                                   # publish the confirmed state back
             return resp.get("error") == 0
         except Exception as e:
-            log("control failed:", e); return False
+            log("LAN control failed:", e); return False
+
+    def control(self, on):
+        return self.lan_control(DEVICES[DEVICE_ID], {"switch": "on" if on else "off"}, "switch")
 
     # eWeLink pushes are unreliable; we poll (re-query) instead. But still grab the
     # instance name from discovery so poll() knows what to re-query.
@@ -296,29 +335,45 @@ class Listener:
     def remove_service(self, zc, type_, name): pass
     def _maybe(self, zc, type_, name):
         info = zc.get_service_info(type_, name, timeout=2000)
-        if self._is_ours(info):
-            self.name = name
-            self._publish(info)
+        cfg = self._match(info)
+        if cfg:
+            self.lan[cfg["id"]]["name"] = name
+            log(f"LAN discovered {cfg['prefix']} at {self.lan[cfg['id']]['addr']}")
+            self._publish(info, cfg)
 
     # Active poll: re-query the service (fresh mDNS query) and re-publish so SignalK
     # stays live even when the device sends no unsolicited updates.
     def poll(self):
-        if not self.name:
-            return
-        info = self.zc.get_service_info("_ewelink._tcp.local.", self.name, timeout=2000)
-        if self._is_ours(info):
-            self._publish(info)
+        for did, st in self.lan.items():
+            if not st.get("name"):
+                continue
+            info = self.zc.get_service_info("_ewelink._tcp.local.", st["name"], timeout=2000)
+            cfg = self._match(info)
+            if cfg:
+                self._publish(info, cfg)
 
-    def _publish(self, info):
+    def _publish(self, info, cfg=None):
         # LAN mDNS carries the SWITCH state reliably; power/V/A over LAN are unreliable
         # (frozen/thresholded) so we take those from the cloud instead.
+        cfg = cfg or DEVICES.get(DEVICE_ID)
         props = _props(info)
         try:
-            p = decrypt(props) if props.get("encrypt") in ("true", True) else {}
+            p = decrypt(props, cfg["key"]) if props.get("encrypt") in ("true", True) else {}
         except Exception as e:
             log("decrypt failed:", e); return
-        if "switch" in p:
-            self.client.publish(f"{PREFIX}/switch", str(1 if p["switch"] == "on" else 0), qos=0, retain=True)
+        if cfg["kind"] == "single":
+            if "switch" in p:
+                self.client.publish(f"{cfg['prefix']}/switch",
+                                    str(1 if p["switch"] == "on" else 0), qos=0, retain=True)
+        else:
+            sws = p.get("switches")
+            if sws:
+                out = {"online": 1}
+                for sw in sws:
+                    o = sw.get("outlet")
+                    if o is not None:
+                        out[f"ch{o + 1}"] = 1 if sw.get("switch") == "on" else 0
+                self.client.publish(f"{cfg['prefix']}/json", json.dumps(out), qos=0, retain=True)
 
     # No cloud data for CLOUD_MAX_FAILS polls in a row -> delete the retained
     # power/voltage/current messages (empty retained payload clears them on the
@@ -350,6 +405,8 @@ class Listener:
         for t in (d.get("data") or {}).get("thingList") or []:
             it = t.get("itemData", {})
             if EWE4_ID and it.get("deviceid") == EWE4_ID:
+                if self.lan_active(EWE4_ID):
+                    continue                       # LAN owns this device's state
                 # one JSON payload, numeric values — per-key string topics are how
                 # shore power became unaverageable strings in Influx (see below)
                 pr = it.get("params", {}) or {}
@@ -370,7 +427,7 @@ class Listener:
                 if k in p:
                     try: out[k] = float(p[k])
                     except Exception: pass
-            if "switch" in p:
+            if "switch" in p and not self.lan_active(DEVICE_ID):
                 out["switch"] = 1 if p["switch"] == "on" else 0
             for k, v in out.items():
                 self.client.publish(f"{PREFIX}/{k}", str(v), qos=0, retain=True)
@@ -425,25 +482,35 @@ def main():
     #   <prefix>/cmd/switch        = on/off -> LAN control of the POWR3 relay
     #   <ewe4 prefix>/cmd/ch[1-4]  = on/off -> CLOUD control of the 4CH (it is on
     #                                another network; the cloud is the only path)
-    def _ewe4_control(ch, on):
+    def _cloud_switch(deviceid, params):
         creds = auth.credentials()
         if not creds:
-            log("ewe4 cmd ignored — no cloud credentials"); return
+            log("cloud control impossible — no credentials"); return False
         at, appid, region = creds
         try:
             d = _cloud_req(f"{_api_base(region)}/v2/device/thing/status",
-                body={"type": 1, "id": EWE4_ID,
-                      "params": {"switches": [{"switch": "on" if on else "off",
-                                               "outlet": ch - 1}]}},
+                body={"type": 1, "id": deviceid, "params": params},
                 bearer=at, appid=appid)
             if d.get("error"):
-                log("ewe4 control error", d.get("error"), d.get("msg", "")); return
-            log(f"ewe4 ch{ch} -> {'on' if on else 'off'}")
-            # confirm quickly so the dashboard's confirmed-state render is not a
-            # full poll interval behind the throw
+                log("cloud control error", d.get("error"), d.get("msg", "")); return False
             listener.cloud_poll()
+            return True
         except Exception as e:
-            log("ewe4 control failed:", e)
+            log("cloud control failed:", e); return False
+
+    def _ewe4_control(ch, on):
+        # ROUTE BY DISCOVERY, not per-operation fallback (Dennis): if mDNS has
+        # the device on OUR network, LAN owns it — a LAN failure is a FAILURE,
+        # logged, not silently retried via cloud where it would mask problems.
+        # Undiscovered = cloud is the route.
+        cfg = DEVICES.get(EWE4_ID)
+        params = {"switches": [{"switch": "on" if on else "off", "outlet": ch - 1}]}
+        if listener.lan_active(EWE4_ID):
+            ok = listener.lan_control(cfg, params, "switches")
+            log(f"ewe4 ch{ch} -> {'on' if on else 'off'} (LAN {'ok' if ok else 'FAILED'})")
+            return
+        ok = _cloud_switch(EWE4_ID, params)
+        log(f"ewe4 ch{ch} -> {'on' if on else 'off'} (cloud {'ok' if ok else 'FAILED'})")
 
     def on_message(cl, ud, msg):
         cmd = msg.payload.decode(errors="ignore").strip().lower()
@@ -457,7 +524,13 @@ def main():
                 _ewe4_control(ch, cmd in ("on", "1", "true"))
             return
         log(f"cmd/switch = {cmd}")
-        listener.control(cmd in ("on", "1", "true"))
+        on = cmd in ("on", "1", "true")
+        # route by discovery: LAN when the POWR3 is on our network (its normal
+        # life), cloud only when it has never been discovered
+        if listener.lan_active(DEVICE_ID):
+            listener.control(on)
+        else:
+            _cloud_switch(DEVICE_ID, {"switch": "on" if on else "off"})
     client.on_message = on_message
     client.subscribe(f"{PREFIX}/cmd/switch")
     if EWE4_ID:
