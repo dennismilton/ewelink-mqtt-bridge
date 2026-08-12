@@ -41,6 +41,7 @@ CLOUD_INTERVAL = int(env("CLOUD_INTERVAL", "60"))
 CLOUD_MAX_FAILS = int(env("CLOUD_MAX_FAILS", "10"))
 LAN_POLL_S = 15                           # LAN re-query cadence
 LAN_MISS_LIMIT = 4                        # poll misses before we UNDISCOVER
+UIACTIVE_S = int(env("UIACTIVE_S", "110")) # re-nudge cadence; device streams 120s
 
 # ── the device registry ──────────────────────────────────────────────────────
 # kind 'single': one relay, {switch:on/off}, state topics <prefix>/<key>,
@@ -419,6 +420,21 @@ class CloudWS:
         log(f"cloud push connected (hb {hb}s)")
         return ws, hb
 
+    def _nudge(self, ws):
+        # THE uiActive NUDGE (measured 2026-08-12: the POWR3 reports power lazily
+        # on its own cadence — the vendor app only looks live because it asks the
+        # device to STREAM for 120s at a time; this is that ask, renewed early).
+        # Sent for every single-kind device; power/V/A always ride the cloud, so
+        # LAN ownership of the switch does not matter here.
+        for cfg in DEVICES.values():
+            if cfg["kind"] != "single":
+                continue
+            ws.send(json.dumps({
+                "action": "update", "deviceid": cfg["id"],
+                "apikey": self.bridge.apikey or "", "userAgent": "app",
+                "sequence": str(int(time.time() * 1000)),
+                "params": {"uiActive": 120}}))
+
     def _run(self):
         backoff = 5
         while True:
@@ -430,10 +446,13 @@ class CloudWS:
                 ws, hb = got
                 backoff = 5
                 ws.settimeout(20)                  # short, so pings stay on schedule
-                last_ping = time.time()
+                last_ping = last_nudge = 0.0
                 while True:
-                    if time.time() - last_ping >= hb:
-                        ws.send("ping"); last_ping = time.time()
+                    now = time.time()
+                    if now - last_ping >= hb:
+                        ws.send("ping"); last_ping = now
+                    if now - last_nudge >= UIACTIVE_S:
+                        self._nudge(ws); last_nudge = now
                     try:
                         raw = ws.recv()
                     except websocket.WebSocketTimeoutException:
@@ -456,7 +475,13 @@ class CloudWS:
 
     def _handle(self, msg):
         cfg = DEVICES.get(msg.get("deviceid"))
-        if not cfg or self.bridge.lan_active(cfg["id"]):
+        if not cfg:
+            return
+        # a LAN-owned MULTI device drops its cloud pushes (LAN owns all its state);
+        # a LAN-owned SINGLE still takes them, because power/V/A only exist on the
+        # cloud stream — publish_state withholds the switch for LAN-owned singles,
+        # so the two routes still cannot fight over a topic
+        if cfg["kind"] == "multi" and self.bridge.lan_active(cfg["id"]):
             return
         if msg.get("action") == "update":
             self.bridge.publish_state(cfg, msg.get("params") or {}, online=True, source="push")

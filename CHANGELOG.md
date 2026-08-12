@@ -3,6 +3,21 @@
 Versions are retrospective tags over the bridge's actual evolution; the repo
 went public at 1.2.0. Dates are commit dates.
 
+## 1.4.0 — 2026-08-12 · live power (the uiActive nudge)
+
+- **Streaming power/V/A.** Measured first: the POWR3 reports power lazily on
+  its own cadence to BOTH transports (LAN record and cloud were byte-identical;
+  a real 17 W load step moved neither for 2.5 min) — the old "LAN freezes,
+  cloud is reliable" rationale blamed the wrong layer and is corrected. The
+  vendor app only looks live because it asks the device to STREAM for 120 s at
+  a time; the bridge now sends that `uiActive` nudge over the push WebSocket
+  every `UIACTIVE_S` (default 110 s), renewed before expiry. Result: watt-level
+  updates every few seconds instead of one frozen reading.
+- Cloud pushes for a LAN-owned **single** device now pass through (power/V/A
+  exist only on the cloud stream); the publisher still withholds the switch,
+  so the routes cannot fight over a topic. LAN-owned multis drop pushes as
+  before.
+
 ## 1.3.0 — 2026-08-12 · the rewrite
 
 - **One publisher, one router.** The LAN and cloud publishing paths had drifted
